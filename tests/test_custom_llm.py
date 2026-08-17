@@ -1,5 +1,7 @@
+import base64
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -179,6 +181,60 @@ class OpenAICompatibleClientTests(unittest.IsolatedAsyncioTestCase):
             [{"role": "user", "content": "hello"}],
         )
 
+    async def test_normalizes_local_file_uri_and_base64_images(self):
+        capture = {}
+        png_base64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNg"
+            "YAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        client = main._OpenAICompatibleClient(
+            api_key="",
+            base_url="https://example.test/v1",
+            model="vision-model",
+            timeout=60,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "test image.png"
+            image_path.write_bytes(base64.b64decode(png_base64))
+            image_refs = [
+                str(image_path),
+                image_path.as_uri(),
+                f"base64://{png_base64}",
+            ]
+            with patch.dict(sys.modules, {"aiohttp": _fake_aiohttp(capture)}):
+                await client.text_chat(
+                    prompt="核查图片",
+                    image_urls=image_refs,
+                    system_prompt="",
+                )
+
+        content = capture["request_kwargs"]["json"]["messages"][0]["content"]
+        normalized_refs = [item["image_url"]["url"] for item in content[1:]]
+        self.assertEqual(len(normalized_refs), 3)
+        for normalized_ref in normalized_refs:
+            self.assertTrue(normalized_ref.startswith("data:image/png;base64,"))
+            self.assertEqual(normalized_ref.split(",", 1)[1], png_base64)
+
+    async def test_rejects_unresolvable_image_before_http_request(self):
+        capture = {}
+        client = main._OpenAICompatibleClient(
+            api_key="",
+            base_url="https://example.test/v1",
+            model="vision-model",
+            timeout=60,
+        )
+
+        with patch.dict(sys.modules, {"aiohttp": _fake_aiohttp(capture)}):
+            with self.assertRaisesRegex(ValueError, "图片引用不是有效"):
+                await client.text_chat(
+                    prompt="核查图片",
+                    image_urls=["not-a-url-or-local-file"],
+                    system_prompt="",
+                )
+
+        self.assertNotIn("url", capture)
+
     async def test_surfaces_openai_error_message(self):
         capture = {}
         client = main._OpenAICompatibleClient(
@@ -248,6 +304,33 @@ class PluginLLMSelectionTests(unittest.TestCase):
         self.assertEqual(plugin._llm_configuration_error(), "")
         self.assertEqual(plugin._resolve_providers(), [plugin.custom_llm])
 
+    def test_formats_result_with_actual_model_name(self):
+        plugin = main.IsItTrue(
+            _FakeContext(),
+            {
+                "llm_source": "custom_api",
+                "custom_base_url": "https://example.test/v1",
+                "custom_model": "grok-4.5",
+            },
+        )
+
+        model_name = plugin._provider_model_name(plugin.custom_llm)
+        result = plugin._format_result_with_source("true\n核查内容属实。", model_name)
+
+        self.assertEqual(result, "✅ 真的喵\n核查内容属实。\n来源：grok-4.5")
+
+    def test_prefers_astrbot_provider_model_name_over_provider_id(self):
+        class _Provider:
+            provider_config = {"id": "provider-id", "model": "config-model"}
+
+            @staticmethod
+            def get_model():
+                return "runtime-model"
+
+        plugin = main.IsItTrue(_FakeContext(), {})
+
+        self.assertEqual(plugin._provider_model_name(_Provider()), "runtime-model")
+
     def test_schema_uses_official_provider_selector(self):
         schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -276,6 +359,45 @@ class ConnectivityTestOptionTests(unittest.IsolatedAsyncioTestCase):
         await plugin.initialize()
 
         plugin.custom_llm.test.assert_awaited_once_with()
+
+
+class ModelFallbackSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reports_model_that_succeeds_after_fallback(self):
+        class _Provider:
+            def __init__(self, model_name, error=None):
+                self.model_name = model_name
+                self.error = error
+                self.provider_config = {
+                    "id": f"provider-{model_name}",
+                    "model": model_name,
+                }
+
+            def get_model(self):
+                return self.model_name
+
+            async def text_chat(self, **_kwargs):
+                if self.error:
+                    raise self.error
+                return main._LLMResponse(completion_text="true\n回退成功。")
+
+        plugin = main.IsItTrue(_FakeContext(), {})
+        providers = [
+            _Provider("primary-model", RuntimeError("primary unavailable")),
+            _Provider("fallback-model"),
+        ]
+        plugin._resolve_providers = lambda: providers
+
+        response, model_name, degraded = await plugin._chat_with_fallback(
+            prompt_with_images="prompt",
+            prompt_without_images="prompt",
+            image_urls=[],
+            system_prompt="system",
+            stage="终判",
+        )
+
+        self.assertEqual(response.completion_text, "true\n回退成功。")
+        self.assertEqual(model_name, "fallback-model")
+        self.assertFalse(degraded)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 import asyncio
+import base64
+import binascii
 import json
+import mimetypes
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -18,7 +22,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -149,6 +153,9 @@ class _OpenAICompatibleClient:
             messages.append({"role": "system", "content": system_prompt})
 
         if image_urls:
+            normalized_image_urls = await asyncio.gather(
+                *(self._normalize_image_ref(image_url) for image_url in image_urls)
+            )
             user_content: list[dict[str, Any]] = [
                 {"type": "text", "text": prompt}
             ]
@@ -157,7 +164,7 @@ class _OpenAICompatibleClient:
                     "type": "image_url",
                     "image_url": {"url": image_url},
                 }
-                for image_url in image_urls
+                for image_url in normalized_image_urls
             )
             messages.append({"role": "user", "content": user_content})
         else:
@@ -197,6 +204,104 @@ class _OpenAICompatibleClient:
         if not content:
             raise RuntimeError("自定义 LLM API 未返回有效的 completion 内容")
         return _LLMResponse(completion_text=content)
+
+    async def _normalize_image_ref(self, image_ref: str) -> str:
+        value = str(image_ref or "").strip()
+        if not value:
+            raise ValueError("图片引用为空")
+        lowered = value.lower()
+        if lowered.startswith(("http://", "https://")):
+            return value
+        if lowered.startswith("data:image/"):
+            header, separator, payload = value.partition(",")
+            if not separator or ";base64" not in header.lower() or not payload.strip():
+                raise ValueError("图片 data URI 不是有效的 base64 图片")
+            return value
+        if lowered.startswith("base64://"):
+            image_bytes = await asyncio.to_thread(
+                self._decode_base64_image,
+                value[len("base64://") :],
+            )
+            return self._image_data_url(image_bytes)
+
+        local_path = self._existing_local_image_path(value)
+        if local_path is None:
+            raise ValueError("图片引用不是有效的 URL、本地文件或 base64 数据")
+        image_bytes = await asyncio.to_thread(local_path.read_bytes)
+        return self._image_data_url(image_bytes, local_path)
+
+    @staticmethod
+    def _existing_local_image_path(image_ref: str) -> Path | None:
+        try:
+            direct_path = Path(image_ref)
+            if direct_path.is_file():
+                return direct_path.resolve()
+        except OSError:
+            pass
+
+        try:
+            parsed = urlsplit(image_ref)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() != "file":
+            return None
+
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            uri_path = f"//{parsed.netloc}{parsed.path}"
+        else:
+            uri_path = parsed.path
+        try:
+            local_path = Path(url2pathname(uri_path))
+            return local_path.resolve() if local_path.is_file() else None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _decode_base64_image(payload: str) -> bytes:
+        compact = re.sub(r"\s+", "", payload or "")
+        if not compact:
+            raise ValueError("base64 图片数据为空")
+        compact += "=" * (-len(compact) % 4)
+        try:
+            image_bytes = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("base64 图片数据无效") from exc
+        if not image_bytes:
+            raise ValueError("base64 图片数据为空")
+        return image_bytes
+
+    @classmethod
+    def _image_data_url(
+        cls,
+        image_bytes: bytes,
+        image_path: Path | None = None,
+    ) -> str:
+        mime_type = cls._detect_image_mime(image_bytes, image_path)
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _detect_image_mime(
+        image_bytes: bytes,
+        image_path: Path | None = None,
+    ) -> str:
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if image_bytes.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+            return "image/webp"
+        if image_bytes.startswith(b"BM"):
+            return "image/bmp"
+
+        guessed_type = None
+        if image_path is not None:
+            guessed_type = mimetypes.guess_type(image_path.name)[0]
+        if guessed_type and guessed_type.startswith("image/"):
+            return guessed_type
+        raise ValueError("无法识别图片格式")
 
     async def test(self) -> None:
         await asyncio.wait_for(
@@ -734,7 +839,7 @@ class IsItTrue(Star):
             )
 
         try:
-            llm_resp, _label, degraded = await self._chat_with_fallback(
+            llm_resp, model_name, degraded = await self._chat_with_fallback(
                 prompt_with_images=prompt,
                 prompt_without_images=degrade_prompt,
                 image_urls=image_urls,
@@ -756,7 +861,9 @@ class IsItTrue(Star):
             yield event.plain_result("模型未返回有效内容。")
             return
 
-        yield event.plain_result(self._format_verdict(content))
+        yield event.plain_result(
+            self._format_result_with_source(content, model_name)
+        )
 
     def _resolve_provider(self):
         if self.provider_id:
@@ -849,6 +956,25 @@ class IsItTrue(Star):
         except Exception:  # noqa: BLE001
             return type(provider).__name__
 
+    def _provider_model_name(self, provider) -> str:
+        if isinstance(provider, _OpenAICompatibleClient):
+            return provider.model or self._provider_label(provider)
+        try:
+            get_model = getattr(provider, "get_model", None)
+            if callable(get_model):
+                model_name = str(get_model() or "").strip()
+                if model_name:
+                    return model_name
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            model_name = str(provider.provider_config.get("model", "") or "").strip()
+            if model_name:
+                return model_name
+        except Exception:  # noqa: BLE001
+            pass
+        return self._provider_label(provider)
+
     async def _chat_with_fallback(
         self,
         *,
@@ -861,7 +987,7 @@ class IsItTrue(Star):
         """按模型回退链调用 text_chat。
 
         每个模型依次尝试「带图」→「剥图」，全部失败才抛最后一个异常。
-        返回 (llm_resp, provider_label, degraded)。
+        返回 (llm_resp, model_name, degraded)。
         """
         providers = self._resolve_providers()
         if not providers:
@@ -869,6 +995,7 @@ class IsItTrue(Star):
         last_err: Exception | None = None
         for provider in providers:
             label = self._provider_label(provider)
+            model_name = self._provider_model_name(provider)
             # 1) 带图尝试
             try:
                 resp = await provider.text_chat(
@@ -879,7 +1006,7 @@ class IsItTrue(Star):
                 logger.info(
                     f"{LOG_PREFIX} {stage} 调用成功 provider={label} vision={'on' if image_urls else 'off'}"
                 )
-                return resp, label, False
+                return resp, model_name, False
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 logger.warning(
@@ -894,7 +1021,7 @@ class IsItTrue(Star):
                         system_prompt=system_prompt,
                     )
                     logger.info(f"{LOG_PREFIX} {stage} 剥图重试成功 provider={label}")
-                    return resp, label, True
+                    return resp, model_name, True
                 except Exception as e:  # noqa: BLE001
                     last_err = e
                     logger.warning(
@@ -1003,6 +1130,13 @@ class IsItTrue(Star):
             ):
                 rest = "\n".join(rest_lines[1:]).strip()
         return f"{label}\n{rest}" if rest else label
+
+    def _format_result_with_source(self, content: str, model_name: str) -> str:
+        result = self._format_verdict(content)
+        safe_model_name = re.sub(r"[\r\n]+", " ", model_name or "").strip()[:120]
+        if not safe_model_name:
+            safe_model_name = "未知模型"
+        return f"{result}\n来源：{safe_model_name}"
 
     @staticmethod
     def _parse_verdict_token(token: str) -> str | None:

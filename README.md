@@ -26,7 +26,7 @@
 
 ### 判定结果
 
-模型首行返回 `true` / `false` / `unknown`（也兼容部分中文写法），插件展示为：
+模型首行返回 `true` / `false` / `unknown`（也兼容部分中文写法），插件展示判定、解释，并在末尾追加实际完成终判的模型名称：`来源：<模型名称>`。
 
 | 模型输出 | 默认展示 | 含义 |
 |---------|---------|------|
@@ -87,7 +87,7 @@
 - `custom_api_key`：通过 `Authorization: Bearer <key>` 发送；留空时不发送 Authorization 请求头。
 - `custom_model`：接口接受的模型 ID，例如 `gpt-4o-mini`、`deepseek-chat` 或本地模型名。
 
-自定义模式支持 OpenAI-compatible 的文本与 `image_url` 消息格式，并复用原有视觉降级逻辑。该模式不会自动回退到 AstrBot Provider，以免请求意外流向另一模型服务。
+自定义模式支持 OpenAI-compatible 的文本与 `image_url` 消息格式。AstrBot 产生的本地路径、`file://` 和 `base64://` 图片会在请求前转换为标准 `data:image/...;base64,...`，公网图片 URL 原样发送；无法解析图片时复用原有视觉降级逻辑。该模式不会自动回退到 AstrBot Provider，以免请求意外流向另一模型服务。
 
 开启 `test_llm_on_startup` 后，插件每次加载或重载都会向当前模型发送一次最小对话请求，并在 AstrBot 日志中记录耗时及成功/失败。此测试是实际 API 调用，可能产生少量 token 费用；测试失败不会阻止插件加载。
 
@@ -166,6 +166,12 @@ astrbot_plugin_isittrue/
 ```
 
 ## 更新日志
+
+### v1.6.1
+
+- **fix**: 自定义 LLM 请求会把本地路径、`file://` 和 `base64://` 图片转换为 OpenAI-compatible data URL，避免上游返回 `invalid_image`
+- **feat**: 判定结果末尾追加实际使用的模型名称；发生回退时显示最终成功模型
+- **test**: 增加本地图片、文件 URI、AstrBot base64 图片和无效引用的回归测试
 
 ### v1.6.0
 
