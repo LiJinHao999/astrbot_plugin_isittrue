@@ -4,7 +4,7 @@
 
 群聊事实核查小工具。@机器人说出你想核实的事情，或**引用一条消息**（支持文本 / 图片 / 合并转发），AI 自动判断真假，返回 `✅ 真的喵` / `❌ 假的喵` / `⚠️ 布吉岛` + 中文解释。
 
-移植自 [@渔火](https://github.com/yhArcadia) 的 `is-it-true.js`，无需额外 API Key，即装即用。
+移植自 [@渔火](https://github.com/yhArcadia) 的 `is-it-true.js`。默认复用 AstrBot 已配置模型，无需额外 API Key；也可切换为自定义 OpenAI-compatible API。
 
 ## 触发方式
 
@@ -53,9 +53,15 @@
 | `listen_suffix` | 监听触发词结尾的消息（无需 @） | false |
 | `listen_prefix` | 监听触发词开头的消息（无需 @） | false |
 | `group_blacklist` | 群黑名单（填群号） | `[]` |
- | `provider_id` | 事实核查模型 Provider ID；**留空=当前默认 Provider** | `""` |
- | `provider_fallbacks` | 模型回退链（Provider ID 列表）：主模型失败后按顺序尝试，每个模型先带图再剥图；留空=只用主模型 | `[]` |
- | `enable_vision` | 是否启用图片分析（需多模态） | true |
+| `llm_source` | LLM 来源：AstrBot 已配置模型 / 自定义 OpenAI 兼容 API | `astrbot_provider` |
+| `provider_id` | 从 WebUI 选择事实核查模型；**留空=当前默认 Provider** | `""` |
+| `provider_fallbacks` | AstrBot 模式的模型回退链；主模型失败后按顺序尝试 | `[]` |
+| `custom_base_url` | 自定义 API Base URL，通常以 `/v1` 结尾 | `https://api.openai.com/v1` |
+| `custom_api_key` | 自定义 API Key；无鉴权的本地服务可留空 | `""` |
+| `custom_model` | 自定义接口实际接受的模型名称 | `""` |
+| `custom_api_timeout` | 自定义 API 请求超时（秒） | 60 |
+| `test_llm_on_startup` | 加载/重载插件时发送一次最小请求测试连通性 | false |
+| `enable_vision` | 是否启用图片分析（需多模态） | true |
 | `enable_web_search` | 启用联网搜索增强（见下） | **false** |
 | `search_timeout` | 联网搜索超时（秒） | 30 |
 | `max_content_chars` | 待核文本最大字符数（超长截断） | 2500 |
@@ -66,6 +72,24 @@
 | `max_forward_images` | 合并转发最多提取图片数（硬上限 20） | 8 |
 | `true_label` / `false_label` / `unknown_label` | 三态展示文案 | 真的喵 / 假的喵 / 布吉岛 |
 | `system_prompt` | 事实核查系统提示词 | 见默认值 |
+
+## 模型配置
+
+### AstrBot 已配置模型
+
+保持 `llm_source=astrbot_provider`，在 `provider_id` 的模型选择器中选择一个已配置的对话模型；留空会使用 AstrBot 当前默认模型。`provider_fallbacks` 仍按原有 Provider ID 顺序提供故障回退。
+
+### 自定义 OpenAI 兼容 API
+
+将 `llm_source` 切换为 `custom_api`，然后填写：
+
+- `custom_base_url`：例如 `https://api.openai.com/v1`。插件会追加 `/chat/completions`；如果填写的地址已经以 `/chat/completions` 结尾，则直接使用。
+- `custom_api_key`：通过 `Authorization: Bearer <key>` 发送；留空时不发送 Authorization 请求头。
+- `custom_model`：接口接受的模型 ID，例如 `gpt-4o-mini`、`deepseek-chat` 或本地模型名。
+
+自定义模式支持 OpenAI-compatible 的文本与 `image_url` 消息格式，并复用原有视觉降级逻辑。该模式不会自动回退到 AstrBot Provider，以免请求意外流向另一模型服务。
+
+开启 `test_llm_on_startup` 后，插件每次加载或重载都会向当前模型发送一次最小对话请求，并在 AstrBot 日志中记录耗时及成功/失败。此测试是实际 API 调用，可能产生少量 token 费用；测试失败不会阻止插件加载。
 
 ## 联网搜索增强（可选）
 
@@ -94,7 +118,7 @@
 
 ## 模型回退（可选）
 
-默认只用一个模型（`provider_id` 或默认 Provider）。配置 `provider_fallbacks` 后可实现多模型容灾：
+AstrBot Provider 模式默认只用一个模型（`provider_id` 或默认 Provider）。配置 `provider_fallbacks` 后可实现多模型容灾：
 
 - 主模型调用失败（网络 / 400 / 限流等）→ 自动按列表顺序切换下一个 Provider ID
 - 每个模型依次尝试「带图」→「剥图纯文本」两级降级（模型不支持图片时）
@@ -120,6 +144,7 @@
 | 频率限制（429 / rate_limit / quota） | AI服务当前繁忙，请稍后重试 |
 | 超时（timeout） | 判断超时，请稍后重试 |
 | 内容过长（context_length） | 内容过长，超出AI处理限制，请精简后重试 |
+| 自定义 Base URL / model 缺失 | 提示检查插件中的自定义大模型配置 |
 | 其他异常 | 判断失败，请稍后重试 |
 
 ## 安装
@@ -136,10 +161,18 @@ astrbot_plugin_isittrue/
 ├── _conf_schema.json    # 可视化配置 schema
 ├── main.py              # 插件主逻辑
 ├── logo.png             # 插件图标
-└── README.md
+├── README.md
+└── tests/               # 自定义 LLM 与配置单元测试
 ```
 
 ## 更新日志
+
+### v1.6.0
+
+- **feat**: `provider_id` 接入 AstrBot 原生模型选择器
+- **feat**: 支持自定义 OpenAI-compatible API、Base URL、API Key、模型名称和请求超时
+- **feat**: 支持加载/重载时测试当前 LLM 连通性，结果写入 AstrBot 日志
+- **test**: 增加自定义 API 请求、响应解析、错误处理及模型来源切换测试
 
 ### v1.2.1
 

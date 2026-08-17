@@ -37,17 +37,84 @@
       "type": "string"
     }
   },
-  "provider_id": {
-    "description": "事实核查模型 Provider ID",
+  "llm_source": {
+    "description": "LLM 来源",
     "type": "string",
-    "hint": "留空则使用当前默认 Provider；填写后优先用指定 Provider，不存在时回退默认",
-    "default": ""
+    "hint": "选择 AstrBot 已配置模型，或直接填写 OpenAI-compatible API。",
+    "options": [
+      "astrbot_provider",
+      "custom_api"
+    ],
+    "labels": [
+      "AstrBot 已配置模型",
+      "自定义 OpenAI 兼容 API"
+    ],
+    "default": "astrbot_provider"
+  },
+  "provider_id": {
+    "description": "事实核查模型",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "从 AstrBot 已配置的对话模型中选择；留空则使用当前默认模型。",
+    "default": "",
+    "condition": {
+      "llm_source": "astrbot_provider"
+    }
   },
   "provider_fallbacks": {
     "type": "list",
     "description": "模型回退链（Provider ID 列表，按顺序尝试）",
     "hint": "主模型（provider_id 或默认 Provider）失败后，依次尝试这里填写的 Provider ID（如 go/deepseek-v4-flash、st/sensenova-6.7-flash-lite），每个模型会先带图尝试、不行再剥图纯文本。留空表示只用主模型。可在 AstrBot 设置页查看 Provider ID",
-    "default": []
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "condition": {
+      "llm_source": "astrbot_provider"
+    }
+  },
+  "custom_base_url": {
+    "description": "自定义 LLM Base URL",
+    "type": "string",
+    "hint": "OpenAI-compatible API 地址，通常以 /v1 结尾；也可直接填写完整的 /chat/completions 地址。",
+    "default": "https://api.openai.com/v1",
+    "condition": {
+      "llm_source": "custom_api"
+    }
+  },
+  "custom_api_key": {
+    "description": "自定义 LLM API Key",
+    "type": "string",
+    "hint": "请求时以 Bearer Token 发送；本地无鉴权服务可留空。配置值不会写入插件日志。",
+    "obvious_hint": true,
+    "default": "",
+    "condition": {
+      "llm_source": "custom_api"
+    }
+  },
+  "custom_model": {
+    "description": "自定义 LLM 模型名称",
+    "type": "string",
+    "hint": "填写接口实际接受的 model，例如 gpt-4o-mini、deepseek-chat 或本地模型 ID。",
+    "default": "",
+    "condition": {
+      "llm_source": "custom_api"
+    }
+  },
+  "custom_api_timeout": {
+    "description": "自定义 LLM 请求超时（秒）",
+    "type": "int",
+    "hint": "自定义 API 的单次请求和连通性测试超时，最小 5 秒。",
+    "default": 60,
+    "condition": {
+      "llm_source": "custom_api"
+    }
+  },
+  "test_llm_on_startup": {
+    "description": "加载时测试 LLM 连通性",
+    "type": "bool",
+    "hint": "开启后，每次加载或重载插件都会向当前选择的模型发送一次最小测试请求，并在 AstrBot 日志中记录成功或失败；不会阻止插件加载。",
+    "default": false
   },
   "enable_web_search": {
     "type": "bool",

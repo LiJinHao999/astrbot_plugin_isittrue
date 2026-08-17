@@ -2,8 +2,10 @@ import asyncio
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -16,6 +18,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
+PLUGIN_VERSION = "1.6.0"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -92,6 +95,155 @@ DEFAULT_MAX_FORWARD_DEPTH = 4
 DEFAULT_MAX_FORWARD_NODES = 40
 DEFAULT_MAX_FORWARD_FETCH = 8
 DEFAULT_MAX_FORWARD_IMAGES = 8
+
+
+@dataclass(slots=True)
+class _LLMResponse:
+    completion_text: str
+
+
+class _OpenAICompatibleClient:
+    """Minimal OpenAI-compatible chat completions client."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout: int,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.base_url = (base_url or "").strip().rstrip("/")
+        self.model = (model or "").strip()
+        self.timeout = max(5, int(timeout or 60))
+        self.provider_config = {"id": f"custom/{self.model or 'unconfigured'}"}
+
+    @property
+    def chat_completions_url(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        return f"{self.base_url}/chat/completions"
+
+    def validate_configuration(self) -> None:
+        if not self.base_url:
+            raise ValueError("自定义 LLM Base URL 不能为空")
+        parsed = urlsplit(self.chat_completions_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("自定义 LLM Base URL 必须是有效的 http(s) 地址")
+        if not self.model:
+            raise ValueError("自定义 LLM 模型名称不能为空")
+
+    async def text_chat(
+        self,
+        *,
+        prompt: str,
+        image_urls: list[str],
+        system_prompt: str,
+    ) -> _LLMResponse:
+        import aiohttp
+
+        self.validate_configuration()
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        if image_urls:
+            user_content: list[dict[str, Any]] = [
+                {"type": "text", "text": prompt}
+            ]
+            user_content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+                for image_url in image_urls
+            )
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(
+                self.chat_completions_url,
+                json=payload,
+                headers=headers,
+            ) as response:
+                response_text = await response.text()
+                if response.status >= 400:
+                    detail = self._extract_error(response_text)
+                    raise RuntimeError(
+                        f"自定义 LLM API HTTP {response.status}: {detail}"
+                    )
+
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"自定义 LLM API 返回了无效 JSON: {response_text[:300]}"
+            ) from exc
+
+        content = self._extract_completion_text(data)
+        if not content:
+            raise RuntimeError("自定义 LLM API 未返回有效的 completion 内容")
+        return _LLMResponse(completion_text=content)
+
+    async def test(self) -> None:
+        await asyncio.wait_for(
+            self.text_chat(
+                prompt="仅回复 OK",
+                image_urls=[],
+                system_prompt="这是一次 API 连通性测试。",
+            ),
+            timeout=self.timeout,
+        )
+
+    @staticmethod
+    def _extract_error(response_text: str) -> str:
+        try:
+            data = json.loads(response_text)
+            error = data.get("error") if isinstance(data, dict) else None
+            if isinstance(error, dict):
+                return str(error.get("message") or error)[:500]
+            if error:
+                return str(error)[:500]
+        except json.JSONDecodeError:
+            pass
+        return (response_text or "未知错误")[:500]
+
+    @staticmethod
+    def _extract_completion_text(data: Any) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return ""
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = [
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            return "".join(text_parts).strip()
+        text = choice.get("text")
+        return text.strip() if isinstance(text, str) else ""
 
 
 class _ForwardBudget:
@@ -276,7 +428,7 @@ class _InlineAnySearchClient:
     "astrbot_plugin_isittrue",
     "konley",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.5.0",
+    PLUGIN_VERSION,
     "https://github.com/konley/astrbot_plugin_isittrue",
 )
 class IsItTrue(Star):
@@ -287,6 +439,13 @@ class IsItTrue(Star):
         self.listen_suffix: bool = bool(config.get("listen_suffix", False))
         self.listen_prefix: bool = bool(config.get("listen_prefix", False))
         self.enable_vision: bool = bool(config.get("enable_vision", True))
+        self.llm_source: str = (
+            str(config.get("llm_source", "astrbot_provider") or "astrbot_provider")
+            .strip()
+            .lower()
+        )
+        if self.llm_source not in {"astrbot_provider", "custom_api"}:
+            self.llm_source = "astrbot_provider"
         self.provider_id: str = str(config.get("provider_id", "") or "").strip()
         raw_fallbacks = config.get("provider_fallbacks", []) or []
         if isinstance(raw_fallbacks, str):
@@ -298,6 +457,20 @@ class IsItTrue(Star):
             if pid and pid not in seen_fallback:
                 seen_fallback.add(pid)
                 self.provider_fallbacks.append(pid)
+        self.custom_api_timeout: int = max(
+            5, int(config.get("custom_api_timeout", 60) or 60)
+        )
+        self.custom_llm = _OpenAICompatibleClient(
+            api_key=str(config.get("custom_api_key", "") or ""),
+            base_url=str(
+                config.get("custom_base_url", "https://api.openai.com/v1") or ""
+            ),
+            model=str(config.get("custom_model", "") or ""),
+            timeout=self.custom_api_timeout,
+        )
+        self.test_llm_on_startup: bool = bool(
+            config.get("test_llm_on_startup", False)
+        )
         self.trigger_phrases: tuple[str, ...] = self._normalize_trigger_phrases(
             config.get("trigger_phrases", DEFAULT_TRIGGER_PHRASES)
         )
@@ -405,13 +578,16 @@ class IsItTrue(Star):
 
     async def initialize(self) -> None:
         logger.info(
-            f"{LOG_PREFIX} 插件已加载 v1.5.0 | triggers={list(self.trigger_phrases)} "
+            f"{LOG_PREFIX} 插件已加载 v{PLUGIN_VERSION} | triggers={list(self.trigger_phrases)} "
+            f"llm_source={self.llm_source} "
             f"web_search={self.enable_web_search} provider={self.search_provider} "
             f"vision={self.enable_vision} "
             f"fallback_providers={self.provider_fallbacks or '-'} "
             f"max_search_queries={self.max_search_queries} "
             f"blacklist={len(self.group_blacklist)}"
         )
+        if self.test_llm_on_startup:
+            await self._test_llm_connectivity()
 
     async def terminate(self) -> None:
         logger.info(f"{LOG_PREFIX} 插件卸载/重载")
@@ -464,11 +640,9 @@ class IsItTrue(Star):
         if not text and not images and not supplement:
             return
 
-        provider = self._resolve_provider()
-        if provider is None:
-            yield event.plain_result(
-                "当前未配置任何大模型提供商，请在 AstrBot 后台配置后再使用。"
-            )
+        llm_error = self._llm_configuration_error()
+        if llm_error:
+            yield event.plain_result(llm_error)
             return
 
         self._cooldowns[user_id] = now
@@ -594,8 +768,54 @@ class IsItTrue(Star):
             )
         return self.context.get_using_provider()
 
+    def _llm_configuration_error(self) -> str:
+        if self.llm_source == "custom_api":
+            try:
+                self.custom_llm.validate_configuration()
+            except ValueError as e:
+                return f"自定义大模型配置无效：{e}。请在插件配置中检查后重试。"
+            return ""
+        if self._resolve_provider() is None:
+            return "当前未配置任何大模型提供商，请在 AstrBot 后台配置后再使用。"
+        return ""
+
+    async def _test_llm_connectivity(self) -> None:
+        error = self._llm_configuration_error()
+        if error:
+            logger.error(f"{LOG_PREFIX} LLM 连通性测试失败：{error}")
+            return
+        providers = self._resolve_providers()
+        if not providers:
+            logger.error(f"{LOG_PREFIX} LLM 连通性测试失败：没有可用模型")
+            return
+        provider = providers[0]
+        label = self._provider_label(provider)
+        started_at = time.monotonic()
+        try:
+            test_method = getattr(provider, "test", None)
+            if callable(test_method):
+                await test_method()
+            else:
+                await provider.text_chat(
+                    prompt="仅回复 OK",
+                    image_urls=[],
+                    system_prompt="这是一次 API 连通性测试。",
+                )
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.info(
+                f"{LOG_PREFIX} LLM 连通性测试成功 | "
+                f"provider={label} elapsed_ms={elapsed_ms}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                f"{LOG_PREFIX} LLM 连通性测试失败 | provider={label}: {e}"
+            )
+
     def _resolve_providers(self) -> list[Any]:
         """模型回退链：主 provider → provider_fallbacks 依次 → 默认 provider 兜底，去重。"""
+        if self.llm_source == "custom_api":
+            return [self.custom_llm]
+
         order: list[Any] = []
         seen_ids: set[str] = set()
 
