@@ -24,7 +24,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.8.0"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -39,6 +39,7 @@ SEARCH_PROVIDER_OPTIONS = (
     "baidu_ai_search",
     "brave",
     "firecrawl",
+    "grok_search",
     "none",
 )
 # auto 模式的降级顺序：tavily 优先（多 Key 轮换+failover），anysearch 兜底
@@ -49,7 +50,123 @@ SEARCH_FALLBACK_ORDER = (
     "brave",
     "firecrawl",
     "anysearch",
+    "grok_search",
 )
+# Grok 联网搜索：移植 GrokSearch-rs 的两条适配通路
+# 1) responses        → POST {base_url}/responses，tools=[{"type":"web_search"}]
+# 2) chat_completions → POST {base_url}/chat/completions，同样带 web_search 工具
+GROK_SEARCH_TRANSPORTS = ("responses", "chat_completions")
+DEFAULT_GROK_SEARCH_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_GROK_SEARCH_MODEL = "grok-4-fast"
+DEFAULT_GROK_SEARCH_TIMEOUT = 120
+DEFAULT_GROK_SEARCH_SYSTEM_PROMPT = (
+    "你是联网搜索助手。先搜索再回答，用中文给出要点式结论，"
+    "涉及事实的句子后附来源链接，不要编造链接或新闻。"
+)
+# 正文里的 [[n]](url) 兜底引用（部分网关只用这种形式回传来源）
+_GROK_URL_PREFIXES = ("http://", "https://")
+_GROK_INLINE_CITATION_RE = re.compile(r"\[\[(\d+)\]\]\((https?://[^\s)\]\[<]+)\)")
+
+
+def _grok_is_junk_title(title: str) -> bool:
+    """上游注解常把引用序号当标题（"1"/"2"），这类标题不算真标题。"""
+    trimmed = (title or "").strip()
+    return len(trimmed) <= 1 or trimmed.isdigit()
+
+
+def _grok_collect_sources(value: Any, out: list[dict[str, str]]) -> None:
+    """把 annotations / citations / search_sources 的多种形状摊平进 out。"""
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, str):
+            if item.startswith(_GROK_URL_PREFIXES):
+                out.append({"url": item, "title": "", "description": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        nested = item.get("url_citation")
+        if isinstance(nested, dict):
+            item = nested
+        url = ""
+        for key in ("url", "uri", "href", "link"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.startswith(_GROK_URL_PREFIXES):
+                url = candidate
+                break
+        if not url:
+            continue
+        title = ""
+        for key in ("title", "name"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and not _grok_is_junk_title(candidate):
+                title = candidate.strip()
+                break
+        description = ""
+        for key in ("description", "snippet", "content"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                description = candidate.strip()
+                break
+        entry: dict[str, str] = {
+            "url": url,
+            "title": title,
+            "description": description,
+        }
+        for key in ("published_date", "publishedDate"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                entry["published_date"] = candidate.strip()
+                break
+        out.append(entry)
+
+
+def _grok_extract_inline_citations(text: str, out: list[dict[str, str]]) -> None:
+    """兜底：有些网关只把来源写成正文里的 [[n]](url) Markdown 标记。"""
+    if not text:
+        return
+    for _label, url in _GROK_INLINE_CITATION_RE.findall(text):
+        out.append({"url": url, "title": "", "description": ""})
+
+
+def _grok_content_text(value: Any) -> str:
+    """chat-completions 的 content 可能是字符串，也可能是 typed parts 数组。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if isinstance(part, dict):
+                for key in ("text", "content", "value"):
+                    text = part.get(key)
+                    if isinstance(text, str):
+                        parts.append(text)
+                        break
+        return "\n".join(chunk for chunk in parts if chunk.strip())
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            text = value.get(key)
+            if isinstance(text, str):
+                return text
+    return ""
+
+
+def _grok_dedupe_sources(sources: list[dict[str, str]]) -> None:
+    """按 URL 去重，保留首次出现的顺序（结构化来源优先于正文兜底）。"""
+    seen: set[str] = set()
+    kept: list[dict[str, str]] = []
+    for src in sources:
+        url = str(src.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        kept.append(src)
+    sources[:] = kept
 # Tavily 等 Key 相关失败状态码：换下一个 Key 重试
 _RETRYABLE_HTTP_STATUSES = frozenset({401, 403, 429, 432})
 # 框架/客户端常见图片占位，不能当有效待核文本或搜索词
@@ -617,6 +734,47 @@ class IsItTrue(Star):
             self.search_provider = "auto"
         self._tavily_key_idx: int = 0  # Tavily 多 Key 轮换指针
         self.search_timeout: int = max(5, int(config.get("search_timeout", 30) or 30))
+        self.grok_search_base_url: str = (
+            str(
+                config.get("grok_search_base_url", DEFAULT_GROK_SEARCH_BASE_URL)
+                or DEFAULT_GROK_SEARCH_BASE_URL
+            )
+            .strip()
+            .rstrip("/")
+        )
+        self.grok_search_api_key: str = str(
+            config.get("grok_search_api_key", "") or ""
+        ).strip()
+        self.grok_search_model: str = str(
+            config.get("grok_search_model", DEFAULT_GROK_SEARCH_MODEL)
+            or DEFAULT_GROK_SEARCH_MODEL
+        ).strip()
+        self.grok_search_transport: str = (
+            str(config.get("grok_search_transport", "responses") or "responses")
+            .strip()
+            .lower()
+        )
+        if self.grok_search_transport not in GROK_SEARCH_TRANSPORTS:
+            self.grok_search_transport = "responses"
+        self.grok_search_timeout: int = max(
+            10,
+            int(
+                config.get("grok_search_timeout", DEFAULT_GROK_SEARCH_TIMEOUT)
+                or DEFAULT_GROK_SEARCH_TIMEOUT
+            ),
+        )
+        self.grok_search_web_search: bool = bool(
+            config.get("grok_search_web_search", True)
+        )
+        self.grok_search_x_search: bool = bool(
+            config.get("grok_search_x_search", False)
+        )
+        self.grok_search_system_prompt: str = str(
+            config.get(
+                "grok_search_system_prompt", DEFAULT_GROK_SEARCH_SYSTEM_PROMPT
+            )
+            or DEFAULT_GROK_SEARCH_SYSTEM_PROMPT
+        ).strip()
         self.max_search_queries: int = min(
             3,
             max(
@@ -1682,6 +1840,8 @@ class IsItTrue(Star):
             return await self._anysearch_search(query, event)
         if provider == "tavily":
             return await self._tavily_search(query)
+        if provider == "grok_search":
+            return await self._grok_search(query)
         return await self._builtin_tool_search(provider, query, event)
 
     async def _tavily_search(self, query: str) -> str:
@@ -1737,7 +1897,191 @@ class IsItTrue(Star):
         if last_err is not None:
             logger.warning(f"{LOG_PREFIX} Tavily 全部 Key 失败：{last_err}")
             raise last_err
-        return ""
+        return "",
+    async def _grok_search(self, query: str) -> str:
+        """Grok 联网搜索渠道（移植 GrokSearch-rs 的 Responses / chat-completions 适配）。
+
+        与 MCP 版同一原理：把问题作为一条 user 消息发给带 web_search 工具的模型，
+        再从 output_text / output[].content[].annotations / citations / 正文 [[n]](url)
+        这些路径同时取回「答案正文」与「来源链接」，拼成参考资料。
+        """
+        if not self.grok_search_api_key:
+            logger.info(f"{LOG_PREFIX} 未配置 Grok 搜索 Key，跳过该渠道")
+            return ""
+        if not self.grok_search_base_url or not self.grok_search_model:
+            logger.info(f"{LOG_PREFIX} Grok 搜索 base_url/model 不完整，跳过该渠道")
+            return ""
+
+        import aiohttp
+
+        url = self._grok_search_endpoint()
+        payload = self._grok_search_payload(query)
+        timeout = aiohttp.ClientTimeout(total=self.grok_search_timeout)
+        logger.info(
+            f"{LOG_PREFIX} Grok 搜索走 {self.grok_search_transport} 渠道：{url} "
+            f"model={self.grok_search_model}"
+        )
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
+                session.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {self.grok_search_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp,
+            ):
+                if resp.status != 200:
+                    reason = (await resp.text())[:200]
+                    logger.warning(
+                        f"{LOG_PREFIX} Grok 搜索 HTTP {resp.status}: {reason}"
+                    )
+                    return ""
+                data = await resp.json()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{LOG_PREFIX} Grok 搜索失败：{e}")
+            return ""
+
+        text, sources = self._parse_grok_search(data)
+        if not text and not sources:
+            logger.info(f"{LOG_PREFIX} Grok 搜索返回空正文且无来源")
+            return ""
+        merged = self._format_grok_search_results(text, sources)
+        return self._truncate(merged, self.max_search_chars)
+
+    def _grok_search_endpoint(self) -> str:
+        """base_url 可带或不带 /responses、/chat/completions 尾巴。"""
+        base = (self.grok_search_base_url or "").strip().rstrip("/")
+        for suffix in ("/chat/completions", "/responses"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if self.grok_search_transport == "chat_completions":
+            return f"{base}/chat/completions"
+        return f"{base}/responses"
+
+    def _grok_search_payload(self, query: str) -> dict[str, Any]:
+        system_text = (
+            self.grok_search_system_prompt or DEFAULT_GROK_SEARCH_SYSTEM_PROMPT
+        )
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": query},
+        ]
+        tools: list[dict[str, str]] = []
+        if self.grok_search_web_search:
+            tools.append({"type": "web_search"})
+        if self.grok_search_x_search:
+            tools.append({"type": "x_search"})
+        if self.grok_search_transport == "chat_completions":
+            payload: dict[str, Any] = {
+                "model": self.grok_search_model,
+                "messages": messages,
+                "stream": False,
+            }
+        else:
+            payload = {
+                "model": self.grok_search_model,
+                "input": messages,
+                "stream": False,
+            }
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    def _parse_grok_search(self, data: Any) -> tuple[str, list[dict[str, str]]]:
+        if self.grok_search_transport == "chat_completions":
+            return self._parse_grok_chat_completions(data)
+        return self._parse_grok_responses(data)
+
+    @staticmethod
+    def _parse_grok_responses(data: Any) -> tuple[str, list[dict[str, str]]]:
+        """解析 /v1/responses：output_text + output[] + citations + 正文兜底。"""
+        if not isinstance(data, dict):
+            return "", []
+        texts: list[str] = []
+        sources: list[dict[str, str]] = []
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            texts.append(output_text.strip())
+        output = data.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "web_search_call":
+                    action = item.get("action")
+                    if isinstance(action, dict):
+                        _grok_collect_sources(action.get("sources"), sources)
+                blocks = item.get("content")
+                if not isinstance(blocks, list):
+                    continue
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text")
+                    if (
+                        isinstance(text, str)
+                        and text.strip()
+                        and text.strip() not in texts
+                    ):
+                        texts.append(text.strip())
+                    _grok_collect_sources(block.get("annotations"), sources)
+                    _grok_collect_sources(block.get("citations"), sources)
+        _grok_collect_sources(data.get("citations"), sources)
+        content = "\n".join(texts).strip()
+        _grok_extract_inline_citations(content, sources)
+        _grok_dedupe_sources(sources)
+        return content, sources
+
+    @staticmethod
+    def _parse_grok_chat_completions(data: Any) -> tuple[str, list[dict[str, str]]]:
+        """解析 /v1/chat/completions：message.content + annotations/citations。"""
+        if not isinstance(data, dict):
+            return "", []
+        sources: list[dict[str, str]] = []
+        message: Any = {}
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message") or {}
+        content = ""
+        if isinstance(message, dict):
+            content = _grok_content_text(message.get("content"))
+            _grok_collect_sources(message.get("annotations"), sources)
+            _grok_collect_sources(message.get("citations"), sources)
+        _grok_collect_sources(data.get("citations"), sources)
+        _grok_collect_sources(data.get("search_sources"), sources)
+        content = content.strip()
+        _grok_extract_inline_citations(content, sources)
+        _grok_dedupe_sources(sources)
+        return content, sources
+
+    @staticmethod
+    def _format_grok_search_results(
+        text: str, sources: list[dict[str, str]]
+    ) -> str:
+        """拼成与其它渠道一致的参考资料块：正文 + 来源清单。"""
+        blocks: list[str] = ["## Grok 联网搜索结果"]
+        if text:
+            blocks.append(text)
+        if sources:
+            lines = ["### 来源"]
+            for idx, src in enumerate(sources, 1):
+                url = str(src.get("url") or "")
+                title = str(src.get("title") or "").strip() or url
+                line = f"{idx}. {title} — {url}"
+                description = str(src.get("description") or "").strip()
+                if description:
+                    line += f"\n   {description[:200]}"
+                lines.append(line)
+            blocks.append("\n".join(lines))
+        if len(blocks) <= 1:
+            return ""
+        return "\n\n".join(blocks)
 
     async def _anysearch_search(
         self, query: str, event: AstrMessageEvent | None = None

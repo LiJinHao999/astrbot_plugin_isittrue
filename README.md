@@ -66,6 +66,13 @@
 | `enable_vision` | 是否启用图片分析（需多模态） | true |
 | `enable_web_search` | 启用联网搜索增强（见下） | **false** |
 | `search_timeout` | 联网搜索超时（秒） | 30 |
+| `grok_search_base_url` | Grok 搜索端点根地址（可带 `/responses` 或 `/chat/completions`） | `https://api.x.ai/v1` |
+| `grok_search_api_key` | Grok 搜索 Key（Bearer）；留空则该渠道跳过 | `""` |
+| `grok_search_model` | 网关上的带搜索模型名 | `grok-4-fast` |
+| `grok_search_transport` | Grok 搜索协议：`responses` / `chat_completions` | `responses` |
+| `grok_search_web_search` / `grok_search_x_search` | 请求里是否带 `web_search` / `x_search` 工具 | true / false |
+| `grok_search_timeout` | Grok 搜索超时（秒，下限 10） | 120 |
+| `grok_search_system_prompt` | Grok 搜索系统提示词 | 见默认值 |
 | `max_content_chars` | 待核文本最大字符数（超长截断） | 2500 |
 | `max_search_chars` | 搜索资料写入 prompt 的上限 | 2000 |
 | `max_forward_depth` | 合并转发最大嵌套层数（硬上限 8） | 4 |
@@ -106,10 +113,11 @@
 
 | 渠道 | 行为 |
 |------|------|
-| `auto` | 按框架配置的 `websearch_provider` 优先，失败自动降级：Tavily 多 Key 轮换 + failover（401/403/429/432 自动换 Key）→ 其他框架内置工具（bocha / baidu_ai_search / brave / firecrawl）→ Anysearch 兜底 |
+| `auto` | 按框架配置的 `websearch_provider` 优先，失败自动降级：Tavily 多 Key 轮换 + failover（401/403/429/432 自动换 Key）→ 其他框架内置工具（bocha / baidu_ai_search / brave / firecrawl）→ Anysearch → Grok 搜索兜底 |
 | `tavily` | 直连 Tavily `/search`，自动读取框架 `provider_settings.websearch_tavily_key`（多 Key round-robin），无需手动填 Key |
 | `anysearch` | 优先已注册的 `anysearch_search` 工具；工具不可用时用内置 HTTP 客户端直连 Anysearch 并尝试读取 anysearch 插件配置中的 `api_key` |
 | `bocha` / `baidu_ai_search` / `brave` / `firecrawl` | 调用框架内置对应搜索工具 |
+| `grok_search` | 直连 Grok 联网搜索：向 `grok_search_base_url` 发带 `tools:[{"type":"web_search"}]` 的请求，按 `grok_search_transport` 走 `/responses`（xAI 原生）或 `/chat/completions`（OpenAI 兼容网关），从 `output_text` / `output[].content[].annotations` / `citations` / 正文 `[[n]](url)` 收集答案与来源；未配置 Key 时该渠道自动跳过 |
 | `none` | 关闭联网搜索 |
 
 - **不是硬依赖**：未安装 `astrbot_plugin_anysearch` 时本插件仍可正常加载与使用
@@ -169,6 +177,13 @@ astrbot_plugin_isittrue/
 
 ## 更新日志
 
+### v1.8.0
+
+- **feat**: 新增 `grok_search` 搜索渠道，移植 grok-search-mcp（GrokSearch-rs）的原理：向 OpenAI/xAI 兼容端点发带 `tools:[{"type":"web_search"}]` 的请求，一条消息既拿回答案正文又拿回来源
+- **feat**: 支持两种传输协议 `grok_search_transport`：`responses`（POST `{base}/responses`，xAI 原生）与 `chat_completions`（POST `{base}/chat/completions`，OpenAI 兼容网关）
+- **feat**: 来源解析覆盖 `output_text`、`web_search_call.action.sources`、`content[].annotations`、`content[].citations`、`message.annotations[].url_citation`、`citations`、`search_sources`，并以正文 `[[n]](url)` 兜底，按 URL 去重保序
+- **feat**: 引用序号（"1"、"2"）这类伪标题会丢弃，避免来源列表里出现纯数字标题
+- **feat**: 独立 `grok_search_timeout`（默认 120 秒，下限 10），不占用 `search_timeout`；未配置 `grok_search_api_key` 时该渠道自动跳过，`auto` 模式下排在最后兜底
 ### v1.7.0
 
 - **feat**: 新增 `llm_source` 开关，可选择 AstrBot 已配置模型或自定义 OpenAI 兼容 API（`custom_base_url` / `custom_api_key` / `custom_model` / `custom_api_timeout`）

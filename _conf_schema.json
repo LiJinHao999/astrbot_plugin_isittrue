@@ -125,7 +125,7 @@
   "search_provider": {
     "type": "string",
     "description": "联网搜索渠道",
-    "hint": "auto=按框架配置的 websearch_provider 优先，失败自动降级（Tavily 多 Key 轮换 → 其他内置渠道 → Anysearch 兜底）；tavily=直连 Tavily 并自动读取框架配置的 Key；anysearch=Anysearch 工具/直连；bocha/baidu_ai_search/brave/firecrawl=调用框架内置工具；none=关闭联网搜索",
+    "hint": "auto=按框架配置的 websearch_provider 优先，失败自动降级（Tavily 多 Key 轮换 → 其他内置渠道 → Anysearch 兜底）；tavily=直连 Tavily 并自动读取框架配置的 Key；anysearch=Anysearch 工具/直连；bocha/baidu_ai_search/brave/firecrawl=调用框架内置工具；grok_search=直连 Grok 联网搜索（Responses/chat-completions 两种协议）；none=关闭联网搜索",
     "options": [
       "auto",
       "tavily",
@@ -134,6 +134,7 @@
       "baidu_ai_search",
       "brave",
       "firecrawl",
+      "grok_search",
       "none"
     ],
     "default": "auto",
@@ -158,6 +159,82 @@
     "type": "int",
     "hint": "超时后自动回退到仅凭模型知识判断",
     "default": 30
+  },
+  "grok_search_base_url": {
+    "description": "Grok 搜索 API 地址",
+    "type": "string",
+    "hint": "OpenAI/xAI 兼容网关的 /v1 根地址，可自带 /responses 或 /chat/completions 尾巴。自建网关示例：http://192.168.0.109:1493/v1",
+    "default": "https://api.x.ai/v1",
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_api_key": {
+    "description": "Grok 搜索 API Key",
+    "type": "string",
+    "hint": "Bearer 鉴权用；留空则该渠道自动跳过",
+    "default": "",
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_model": {
+    "description": "Grok 搜索模型",
+    "type": "string",
+    "hint": "网关上的带搜索模型名，例如 grok-4-fast 或自建网关的 web2api/grok-4.20-multi-agent-0309",
+    "default": "grok-4-fast",
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_transport": {
+    "description": "Grok 搜索协议",
+    "type": "string",
+    "hint": "responses=POST {base}/responses（xAI 原生，带 tools.web_search）；chat_completions=POST {base}/chat/completions（OpenAI 兼容网关）",
+    "options": [
+      "responses",
+      "chat_completions"
+    ],
+    "default": "responses",
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_web_search": {
+    "description": "请求里带上 web_search 工具",
+    "type": "bool",
+    "hint": "部分网关会忽略该字段，不影响请求成功",
+    "default": true,
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_x_search": {
+    "description": "额外请求 X（推特）搜索工具",
+    "type": "bool",
+    "hint": "仅 Responses 协议下有意义，网关不支持时会报错回退",
+    "default": false,
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_timeout": {
+    "description": "Grok 搜索超时（秒）",
+    "type": "int",
+    "hint": "多 agent 搜索通常比普通搜索慢，默认 120 秒；超时由 search_timeout 之外单独控制",
+    "default": 120,
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_system_prompt": {
+    "description": "Grok 搜索的系统提示词",
+    "type": "string",
+    "hint": "影响搜索结果的组织方式，要求模型给出要点并附来源链接",
+    "default": "你是联网搜索助手。先搜索再回答，用中文给出要点式结论，涉及事实的句子后附来源链接，不要编造链接或新闻。",
+    "condition": {
+      "enable_web_search": true
+    }
   },
   "max_content_chars": {
     "description": "待核文本最大字符数",
