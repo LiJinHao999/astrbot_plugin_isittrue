@@ -173,7 +173,7 @@
 | `tavily` | 直连 Tavily `/search`，自动读取框架 `provider_settings.websearch_tavily_key`（多 Key round-robin），无需手动填 Key |
 | `anysearch` | 优先已注册的 `anysearch_search` 工具；工具不可用时用内置 HTTP 客户端直连 Anysearch 并尝试读取 anysearch 插件配置中的 `api_key` |
 | `bocha` / `baidu_ai_search` / `brave` / `firecrawl` | 调用框架内置对应搜索工具 |
-| `grok_search` | 直连 Grok 联网搜索：向 `grok_search_base_url` 发带 `tools:[{"type":"web_search"}]` 的请求，按 `grok_search_transport` 走 `/responses`（xAI 原生）或 `/chat/completions`（OpenAI 兼容网关），从 `output_text` / `output[].content[].annotations` / `citations` / 正文 `[[n]](url)` 收集答案与来源；未配置 Key 时该渠道自动跳过 |
+| `grok_search` | 直连 Grok 联网搜索：向 `grok_search_base_url` 发带 `tools:[{"type":"web_search"}]` 的请求，按 `grok_search_transport` 走 `/responses`（xAI 原生）或 `/chat/completions`（OpenAI 兼容网关），从 `output_text` / `output[].content[].annotations` / `citations` / 正文 `[[n]](url)` 收集答案与来源；未配置 Key 时该渠道自动跳过。该渠道是 agent 型检索，会把整条 CLAIM + 规划器关键词合并成 **一条完整检索请求**（说法 + 检索重点 + 当前时间）发给 Grok，而不是逐个发短关键词 |
 | `none` | 关闭联网搜索 |
 
 - **不是硬依赖**：未安装 `astrbot_plugin_anysearch` 时本插件仍可正常加载与使用
@@ -232,6 +232,12 @@ astrbot_plugin_isittrue/
 ```
 
 ## 更新日志
+
+### v1.8.3
+
+- **feat**: `grok_search` 渠道改为发送完整核查请求而不是短关键词：Grok 是 agent 型检索（自己规划检索词），只给几个词它只搜那几个词，给出整句主张 + 核查要求它会自己拆成多个精准角度；因此该渠道下把 `CLAIM` + 规划器关键词合并成一条请求（说法句 + 检索重点 + 当前时间），只发 1 次
+- **feat**: `grok_search` 系统提示词重写为纯检索助手：只列出检索到的要点、涉及事实的句子后附来源链接，检索不到直说不得编造；不要求它「必须先调 web_search」，也不要求它判定说法成不成立（真假由本插件终判模型负责）
+- **fix**: 其他搜索渠道行为不变（仍按关键词逐条查询）
 
 ### v1.8.2
 

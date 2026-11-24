@@ -25,7 +25,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.2"
+PLUGIN_VERSION = "1.8.3"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -86,9 +86,13 @@ DEFAULT_GROK_SEARCH_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GROK_SEARCH_MODEL = "grok-4-fast"
 DEFAULT_GROK_SEARCH_TIMEOUT = 120
 DEFAULT_GROK_SEARCH_SYSTEM_PROMPT = (
-    "你是联网搜索助手。先搜索再回答，用中文给出要点式结论，"
-    "涉及事实的句子后附来源链接，不要编造链接或新闻。"
+    "你是联网搜索助手，任务是搜集与请求相关的公开资料。"
+    "以要点形式列出检索到的信息，涉及事实的句子后附来源链接，"
+    "不要编造链接、版本号或新闻；检索不到就直说找不到，不要用训练记忆冒充检索结果。"
 )
+# Grok 是 agent 型检索：它自己拆检索角度，所以喂完整检索请求（而不是几个关键词）效果最好。
+# 该前缀同时用于识别「已经是完整检索请求」，避免二次包装。
+GROK_REQUEST_PREFIX = "请检索与下面这条说法相关的公开信息"
 # 正文里的 [[n]](url) 兜底引用（部分网关只用这种形式回传来源）
 _GROK_URL_PREFIXES = ("http://", "https://")
 _GROK_INLINE_CITATION_RE = re.compile(r"\[\[(\d+)\]\]\((https?://[^\s)\]\[<]+)\)")
@@ -1130,11 +1134,11 @@ class IsItTrue(Star):
                     self.max_search_chars
                     // max(1, min(len(queries), self.max_search_queries)),
                 )
-                for q in queries[: self.max_search_queries]:
+                for search_label, q in self._search_items(claim, queries):
                     logger.info(f"{LOG_PREFIX} 准备联网搜索：{q!r}")
-                    one = await self._web_search(q, event=event)
+                    one = await self._web_search(q, event=event, claim=claim)
                     if one:
-                        blocks.append(f"### 查询：{q}\n{one}")
+                        blocks.append(f"### 查询：{search_label}\n{one}")
                         logger.info(
                             f"{LOG_PREFIX} 搜索成功 query={q!r} len={len(one)} "
                             f"preview={one[:120]!r}"
@@ -2144,7 +2148,9 @@ class IsItTrue(Star):
         return out
 
     async def _web_search(
-        self, query: str, event: AstrMessageEvent | None = None
+        self, query: str,
+        event: AstrMessageEvent | None = None,
+        claim: str = "",
     ) -> str:
         """搜索渠道适配层入口。
 
@@ -2159,7 +2165,7 @@ class IsItTrue(Star):
         provider = self.search_provider
         if provider != "auto":
             try:
-                return await self._search_with(provider, query, event)
+                return await self._search_with(provider, query, event, claim)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"{LOG_PREFIX} {provider} 搜索失败：{e}")
                 return ""
@@ -2167,7 +2173,7 @@ class IsItTrue(Star):
         last_err: Exception | None = None
         for cand in self._auto_search_order():
             try:
-                result = await self._search_with(cand, query, event)
+                result = await self._search_with(cand, query, event, claim)
                 if result:
                     return result
                 logger.info(f"{LOG_PREFIX} {cand} 返回空结果，尝试下一渠道")
@@ -2213,7 +2219,10 @@ class IsItTrue(Star):
         return [str(k).strip() for k in raw if str(k).strip()]
 
     async def _search_with(
-        self, provider: str, query: str, event: AstrMessageEvent | None = None
+        self, provider: str,
+        query: str,
+        event: AstrMessageEvent | None = None,
+        claim: str = "",
     ) -> str:
         """按渠道分发：tavily 直连 / anysearch 工具或内联 / 其余走框架内置工具。"""
         if provider == "anysearch":
@@ -2221,7 +2230,7 @@ class IsItTrue(Star):
         if provider == "tavily":
             return await self._tavily_search(query)
         if provider == "grok_search":
-            return await self._grok_search(query)
+            return await self._grok_search(query, claim=claim)
         return await self._builtin_tool_search(provider, query, event)
 
     async def _tavily_search(self, query: str) -> str:
@@ -2278,7 +2287,7 @@ class IsItTrue(Star):
             logger.warning(f"{LOG_PREFIX} Tavily 全部 Key 失败：{last_err}")
             raise last_err
         return "",
-    async def _grok_search(self, query: str) -> str:
+    async def _grok_search(self, query: str, claim: str = "") -> str:
         """Grok 联网搜索渠道（移植 GrokSearch-rs 的 Responses / chat-completions 适配）。
 
         与 MCP 版同一原理：把问题作为一条 user 消息发给带 web_search 工具的模型，
@@ -2295,7 +2304,12 @@ class IsItTrue(Star):
         import aiohttp
 
         url = self._grok_search_endpoint()
-        payload = self._grok_search_payload(query)
+        prompt = (
+            query
+            if (query or "").strip().startswith(GROK_REQUEST_PREFIX)
+            else self._grok_search_request(claim, query)
+        )
+        payload = self._grok_search_payload(prompt)
         timeout = aiohttp.ClientTimeout(total=self.grok_search_timeout)
         logger.info(
             f"{LOG_PREFIX} Grok 搜索走 {self.grok_search_transport} 渠道：{url} "
@@ -2341,6 +2355,56 @@ class IsItTrue(Star):
         if self.grok_search_transport == "chat_completions":
             return f"{base}/chat/completions"
         return f"{base}/responses"
+
+    def _grok_search_request(
+        self, claim: str, queries: str | list[str]
+    ) -> str:
+        """把短关键词 + claim 拼成完整检索请求。
+
+        Grok 的 web_search 是 agent 型检索：拿到几个词就只搜那几个词，
+        拿到一句完整问题才会自己拆成多个检索角度。所以这里统一补上要查的说法、
+        检索重点、来源要求与当前时间；已经是完整请求时原样返回。
+        """
+        raw = [queries] if isinstance(queries, str) else list(queries or [])
+        focus: list[str] = []
+        for item in raw:
+            q = re.sub(r"\s+", " ", str(item or "")).strip()
+            if not q:
+                continue
+            if q.startswith(GROK_REQUEST_PREFIX):
+                return q
+            if not self._is_useless_search_query(q) and q not in focus:
+                focus.append(q)
+        claim = re.sub(r"\s+", " ", (claim or "")).strip()
+        if not claim and focus:
+            claim = focus.pop(0)
+        # claim 的截断前缀会被当成搜索词传来，不要重复列出
+        focus = [q for q in focus if q not in claim]
+        lines = [f"{GROK_REQUEST_PREFIX}。"]
+        if claim:
+            lines.append(f"说法：{claim}")
+        if focus:
+            lines.append(f"检索重点：{'；'.join(focus)}")
+        lines.append(f"当前时间：{self._now_label()}。")
+        lines.append(
+            "以要点形式列出检索到的信息，涉及事实的句子后附来源链接；"
+            "检索不到就直说找不到，不要编造链接、版本号或公告。"
+        )
+        return "\n".join(lines)
+
+    def _search_items(self, claim: str, queries: list[str]) -> list[tuple[str, str]]:
+        """按渠道决定搜索输入：返回 (展示用标签, 实际发给搜索渠道的文本)。
+
+        显式启用 grok_search 时把多条关键词合并成一条完整检索请求——Grok 一次
+        完整问题比两条关键词更有效；其它渠道仍逐条关键词（Tavily 类关键词 API）。
+        """
+        picked = [q for q in (queries or []) if q][: self.max_search_queries]
+        if not picked:
+            return []
+        if self.search_provider == "grok_search":
+            label = (claim or picked[0])[:60]
+            return [(label, self._grok_search_request(claim, picked))]
+        return [(q, q) for q in picked]
 
     def _grok_search_payload(self, query: str) -> dict[str, Any]:
         system_text = (
