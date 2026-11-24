@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 import mimetypes
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -24,11 +25,34 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.1"
+PLUGIN_VERSION = "1.8.2"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
 DEFAULT_UNKNOWN_LABEL = "⚠️ 布吉岛"
+# 调侃/锐评的默认风格要求，注入终判系统提示词，让模型在同一次回复里给出核查结果与调侃
+DEFAULT_ROAST_PROMPT = (
+    "你是群聊里的毒舌评论员，会在给出核查结论后补一段调侃。\n"
+    "1. 只针对观点本身和它的离谱程度下嘴，不要复述核查过程、不要罗列证据，"
+    "也不要写「无法核实」「缺乏信息」「建议查证」这类话。\n"
+    "2. 属实就调侃「居然是真的」或观点里想当然的地方；不实就调侃它假得多明目张胆、编得多用心；"
+    "无法核实就调侃这种既没法证实也没法证伪的说法有多没信息量。\n"
+    "3. 可以阴阳怪气、打比方、用网络梗，但不得人身攻击群友、不用脏话、不涉及敏感话题，"
+    "不编造事实当依据。\n"
+    "4. 中文，不超过 80 字，一到两句话；不要 Markdown、引号堆砌或表情符号。"
+)
+# 判定结果分块展示：true/false 出「核查结果 + 锐评调侃」两块，unknown 只出调侃一块
+VERDICT_CHECK_HEADER = "📌 核查结果"
+VERDICT_ROAST_HEADER = "😏 锐评调侃"
+VERDICT_CHECK_NAMES = ("核查结果",)
+VERDICT_ROAST_NAMES = ("锐评调侃", "锐评", "调侃")
+# 贴表情（移植自 astrbot_plugin_iamthinking）：OneBot/QQ 表情 ID
+# 66=思考中，74=赞/完成，264=捂脸，270=emm
+DEFAULT_START_EMOJI_IDS = (66,)
+DEFAULT_TRUE_EMOJI_IDS = (74,)
+DEFAULT_FALSE_EMOJI_IDS = (264,)
+DEFAULT_UNKNOWN_EMOJI_IDS = (270,)
+DEFAULT_ERROR_EMOJI_IDS: tuple[int, ...] = ()
 # 判定结果的指代方式：quote=引用触发消息，at=@ 提问者，none=不指代
 REPLY_QUOTE_MODES = ("quote", "at", "none")
 DEFAULT_MAX_SEARCH_QUERIES = 2
@@ -853,11 +877,38 @@ class IsItTrue(Star):
             ).strip()
             or DEFAULT_UNKNOWN_LABEL
         )
+# 留空则不启用：只显示核查解释，不额外调用锐评模型
+        self.unknown_roast_prompt: str = str(
+            config.get("unknown_roast_prompt", DEFAULT_ROAST_PROMPT) or ""
+        ).strip()
         self.reply_quote_mode: str = (
             str(config.get("reply_quote_mode", "quote") or "quote").strip().lower()
         )
         if self.reply_quote_mode not in REPLY_QUOTE_MODES:
             self.reply_quote_mode = "quote"
+# 贴表情提示（移植自 astrbot_plugin_iamthinking）：开始/结束核查时给触发消息贴表情
+        self.emoji_reaction_enabled: bool = bool(
+            config.get("enable_emoji_reaction", True)
+        )
+        self.emoji_pick_random: bool = bool(config.get("emoji_pick_random", True))
+        self.start_emoji_ids: list[int] = self._as_int_list(
+            config.get("start_emoji_ids", list(DEFAULT_START_EMOJI_IDS))
+        )
+        self.true_emoji_ids: list[int] = self._as_int_list(
+            config.get("true_emoji_ids", list(DEFAULT_TRUE_EMOJI_IDS))
+        )
+        self.false_emoji_ids: list[int] = self._as_int_list(
+            config.get("false_emoji_ids", list(DEFAULT_FALSE_EMOJI_IDS))
+        )
+        self.unknown_emoji_ids: list[int] = self._as_int_list(
+            config.get("unknown_emoji_ids", list(DEFAULT_UNKNOWN_EMOJI_IDS))
+        )
+        self.error_emoji_ids: list[int] = self._as_int_list(
+            config.get("error_emoji_ids", list(DEFAULT_ERROR_EMOJI_IDS))
+        )
+        self.remove_start_emoji_on_end: bool = bool(
+            config.get("remove_start_emoji_on_end", True)
+        )
         self.system_prompt: str = (
             str(
                 config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
@@ -872,6 +923,103 @@ class IsItTrue(Star):
             or DEFAULT_PLAN_PROMPT
         )
         self._cooldowns: dict[str, float] = {}
+# ==== 贴表情提示（移植自 astrbot_plugin_iamthinking）====
+    @staticmethod
+    def _as_int_list(value: Any) -> list[int]:
+        """把配置里的表情 ID（列表或逗号/空格分隔的字符串）规整成 int 列表。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [p for p in re.split(r"[,，\s]+", value) if p]
+        if not isinstance(value, (list, tuple, set)):
+            value = [value]
+        ids: list[int] = []
+        for item in value:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def _emoji_target(self, event: AstrMessageEvent) -> tuple[Any, Any] | None:
+        """返回 (bot, message_id)；当前平台/账号不支持贴表情时返回 None。"""
+        if not self.emoji_reaction_enabled:
+            return None
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        bot = getattr(event, "bot", None)
+        if bot is None or not hasattr(bot, "set_msg_emoji_like"):
+            logger.debug(f"{LOG_PREFIX} bot 不支持 set_msg_emoji_like，跳过贴表情")
+            return None
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None) if message_obj else None
+        if message_id is None or message_id == "":
+            logger.debug(f"{LOG_PREFIX} 触发消息无 message_id，跳过贴表情")
+            return None
+        return bot, message_id
+
+    async def _emoji_like(
+        self, event: AstrMessageEvent, emoji_ids: list[int], *, set_: bool
+    ) -> bool:
+        """给触发消息贴（set_=True）或撤（set_=False）表情。
+
+        失败只记日志，不影响核查主流程。
+        """
+        target = self._emoji_target(event)
+        if target is None:
+            return False
+        if not emoji_ids:
+            return True
+        bot, message_id = target
+        ids = sorted(set(emoji_ids))
+        if set_ and self.emoji_pick_random and len(ids) > 1:
+            # 贴的时候只随机取一个；撤回时才逐个撤
+            ids = [random.choice(ids)]
+        all_ok = True
+        for emoji_id in ids:
+            try:
+                logger.debug(
+                    f"{LOG_PREFIX} 贴表情 | message_id={message_id} "
+                    f"emoji_id={emoji_id} set={set_}"
+                )
+                await bot.set_msg_emoji_like(
+                    message_id=message_id, emoji_id=emoji_id, set=set_
+                )
+            except Exception as e:  # noqa: BLE001
+                all_ok = False
+                logger.warning(
+                    f"{LOG_PREFIX} 贴表情失败 | message_id={message_id} "
+                    f"emoji_id={emoji_id} set={set_} err={e}"
+                )
+        return all_ok
+
+    def _verdict_emoji_ids(self, verdict: str) -> list[int]:
+        """按判定结果取结束表情列表。"""
+        return {
+            "true": self.true_emoji_ids,
+            "false": self.false_emoji_ids,
+            "unknown": self.unknown_emoji_ids,
+            "error": self.error_emoji_ids,
+        }.get(verdict, [])
+
+    async def _start_emoji(self, event: AstrMessageEvent) -> None:
+        """开始核查：给触发消息贴「处理中」表情。"""
+        if not self.emoji_reaction_enabled or not self.start_emoji_ids:
+            return
+        await self._emoji_like(event, self.start_emoji_ids, set_=True)
+
+    async def _finish_emoji(self, event: AstrMessageEvent, verdict: str) -> None:
+        """结束核查：先撤「处理中」表情，再按结果贴对应的结束表情。"""
+        if not self.emoji_reaction_enabled:
+            return
+        if self.remove_start_emoji_on_end and self.start_emoji_ids:
+            await self._emoji_like(event, self.start_emoji_ids, set_=False)
+        emoji_ids = self._verdict_emoji_ids(verdict)
+        if emoji_ids:
+            await self._emoji_like(event, emoji_ids, set_=True)
 
     async def initialize(self) -> None:
         logger.info(
@@ -943,6 +1091,8 @@ class IsItTrue(Star):
             return
 
         self._cooldowns[user_id] = now
+# 开始核查：给触发消息贴「处理中」表情（非 aiocqhttp / 不支持表情时自动跳过）
+        await self._start_emoji(event)
 
         notes: list[str] = []
         if image_note:
@@ -1042,7 +1192,8 @@ class IsItTrue(Star):
                 prompt_with_images=prompt,
                 prompt_without_images=degrade_prompt,
                 image_urls=image_urls,
-                system_prompt=self.system_prompt,
+# 终判同一次回复里出「核查结果 + 锐评调侃」两块；未配调侃提示词时只加空串
+                system_prompt=f"{self.system_prompt}{self._roast_format_section()}",
                 stage="终判",
             )
             content = (llm_resp.completion_text or "").strip()
@@ -1053,14 +1204,23 @@ class IsItTrue(Star):
         except Exception as e:  # noqa: BLE001
             err_msg = str(e)
             logger.exception(f"{LOG_PREFIX} 全部模型回退链调用失败: {err_msg}")
+            await self._finish_emoji(event, "error")
             yield event.plain_result(self._friendly_error(err_msg))
             return
 
         if not content:
+            await self._finish_emoji(event, "error")
             yield event.plain_result("模型未返回有效内容。")
             return
+# 判定与调侃同一次输出：true/false 出「核查结果 + 锐评调侃」，unknown 只留调侃
+        verdict = self._detect_verdict(content) or "unknown"
+        if self.unknown_roast_prompt:
+            content = self._compose_verdict_content(verdict, content)
         logger.info(
             f"{LOG_PREFIX} 判定完成 | 模型={model_name} degraded={degraded}"
+        )
+        await self._finish_emoji(
+            event, verdict
         )
         yield event.chain_result(self._build_result_chain(content, event))
 
@@ -1147,6 +1307,7 @@ class IsItTrue(Star):
             order.append(self.context.get_using_provider())
         return order
 
+
     def _provider_label(self, provider) -> str:
         try:
             return (
@@ -1189,6 +1350,7 @@ class IsItTrue(Star):
         返回 (llm_resp, model_name, degraded)。
         """
         system_prompt = self._with_runtime_time(system_prompt)
+# 终判与调侃在同一次调用里完成，共用主模型回退链
         providers = self._resolve_providers()
         if not providers:
             raise RuntimeError("未配置任何可用的模型 Provider")
@@ -1292,10 +1454,17 @@ class IsItTrue(Star):
             )
         if notes:
             parts.append("【备注】" + "；".join(notes))
-        parts.append(
-            "【输出】第一行 true/false/unknown；第二行起中文解释（200字以内）。"
-            "先点明判定对象，再写关键原因和机制。"
-        )
+# 配了调侃提示词时，用户提示词的输出要求也换成分块格式，免得和 system 里的要求打架
+        if self.unknown_roast_prompt:
+            parts.append(
+                "【输出】第一行只写 true/false/unknown；之后按系统要求的分块格式输出："
+                "true/false 先写核查结果、再写调侃；unknown 只写调侃，不写核查解释。"
+            )
+        else:
+            parts.append(
+                "【输出】第一行 true/false/unknown；第二行起中文解释（200字以内）。"
+                "先点明判定对象，再写关键原因和机制。"
+            )
         return "\n".join(parts)
 
     def _with_runtime_time(self, system_prompt: str) -> str:
@@ -1323,33 +1492,214 @@ class IsItTrue(Star):
             now = datetime.now(timezone.utc)
             return now.strftime("%Y-%m-%d %H:%M UTC")
 
-    def _format_verdict(self, content: str) -> str:
+# 判定解析：展示文案与结束表情共用同一套 true / false / unknown 识别
+    def _detect_verdict(self, content: str) -> str | None:
         lines = content.strip().splitlines()
         if not lines:
-            return content
+            return None
 
-        rest = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
         verdict = self._parse_verdict_token(lines[0].strip())
-
         if verdict is None:
             for line in lines[:4]:
                 verdict = self._parse_verdict_token(line.strip())
                 if verdict is not None:
+                    break
+
+# 调侃正文里常有「属实/谣言/没法证实」等词：兜底只看核查块，多个信号按出现位置取最早
+        if verdict is None:
+            head_lines = self._split_reply_blocks(lines)[0]
+            lowered = "\n".join(head_lines).lower()
+            # 同时出现多个信号时按出现位置取最早的那个，避免 false 分支永远优先
+            signals = (
+                ("false", r"\bfalse\b|不实|为假|是假的|谣言"),
+                ("unknown", r"\bunknown\b|无法(?:核实|确认|确定)|不确定|布吉岛"),
+                ("true", r"\btrue\b|属实|为真|是真的"),
+            )
+            best: tuple[int, str] | None = None
+            for name, pattern in signals:
+                match = re.search(pattern, lowered)
+                if match is not None and (best is None or match.start() < best[0]):
+                    best = (match.start(), name)
+            if best is not None:
+                verdict = best[1]
+        return verdict
+
+# 调侃要求并进终判系统提示词：同一次调用就输出「核查结果 + 锐评调侃」两块，不再单独调模型
+    def _roast_format_section(self) -> str:
+        """返回拼到终判系统提示词末尾的分块输出要求；未配置调侃提示词时返回空串。"""
+        prompt = self.unknown_roast_prompt
+        if not prompt:
+            return ""
+        return (
+            "\n\n【输出格式】第一行只写判定词 true / false / unknown，不要写多余内容。\n"
+            "判定词之后的核查解释写两到三句，不要罗列检索过程，也不要编造来源。\n"
+            "判定为 true 或 false 时，判定词之后依次写两块：\n"
+            f"{VERDICT_CHECK_HEADER}\n<两三句核查结论，写明依据，不要罗列检索步骤>\n\n"
+            f"{VERDICT_ROAST_HEADER}\n<一段调侃，不超过 80 字，一到两句话>\n"
+            "判定为 unknown 时只写调侃一块：不要出现核查结果标题，也不要写核查解释。\n"
+            "分块标题必须原样保留；除这两块标题外不要使用其它 Markdown 标题。\n"
+            "【调侃要求】\n"
+            f"{prompt}"
+        )
+
+# 分块解析：标题容忍 Markdown 加粗/引用符/任意 emoji，true/false 出两块，unknown 只留调侃
+    def _compose_verdict_content(self, verdict: str, content: str) -> str:
+        if not self.unknown_roast_prompt:
+            return content
+        lines = [
+            line.strip()
+            for line in content.strip().splitlines()
+            if line.strip() and not re.fullmatch(r"`{3,}[\w-]*", line.strip())
+        ]
+        if lines:
+            lines[0] = self._strip_verdict_word(lines[0])
+            if not lines[0]:
+                lines.pop(0)
+        check_lines, roast_lines = self._split_reply_blocks(lines)
+        explanation = self._clean_explanation(check_lines)
+        roast = self._clean_roast_text("".join(roast_lines))
+        if verdict == "unknown":
+            if not roast:
+                # 模型没给调侃块时只回显判定与正文，不补核查结果标题
+                return f"unknown\n{explanation}" if explanation else content
+            return f"unknown\n{VERDICT_ROAST_HEADER}\n{roast}"
+        if not roast:
+            return f"{verdict}\n{explanation}" if explanation else content
+        if not explanation:
+            return f"{verdict}\n{VERDICT_ROAST_HEADER}\n{roast}"
+        return (
+            f"{verdict}\n{VERDICT_CHECK_HEADER}\n{explanation}\n\n"
+            f"{VERDICT_ROAST_HEADER}\n{roast}"
+        )
+
+    def _split_reply_blocks(self, lines: list[str]) -> tuple[list[str], list[str]]:
+        """按两个分块标题切出（核查结果正文, 调侃正文）；标题顺序颠倒也能正确归类。"""
+        check_at: int | None = None
+        roast_at: int | None = None
+        check_inline = ""
+        roast_inline = ""
+        for idx, line in enumerate(lines):
+            if check_at is None:
+                hit = self._block_header(line, VERDICT_CHECK_NAMES)
+                if hit is not None:
+                    check_at, check_inline = idx, hit[1]
+                    continue
+            if roast_at is None:
+                hit = self._block_header(line, VERDICT_ROAST_NAMES)
+                if hit is not None:
+                    roast_at, roast_inline = idx, hit[1]
+        check_lines = [check_inline] if check_inline else []
+        roast_lines = [roast_inline] if roast_inline else []
+        owner = "roast" if (roast_at is not None and roast_at == 0) else "check"
+        for idx, line in enumerate(lines):
+            if idx == check_at:
+                owner = "check"
+                continue
+            if idx == roast_at:
+                owner = "roast"
+                continue
+# 重复出现的标题行不再往正文里塞
+            if self._block_header(line, VERDICT_CHECK_NAMES) or self._block_header(
+                line, VERDICT_ROAST_NAMES
+            ):
+                continue
+            (roast_lines if owner == "roast" else check_lines).append(line)
+        return check_lines, roast_lines
+
+    @staticmethod
+    def _strip_decor(text: str) -> tuple[str, bool]:
+        """去掉行首的 Markdown / emoji / 括号修饰，返回 (正文, 是否带修饰)。"""
+        idx = 0
+        while idx < len(text) and not (
+            text[idx].isalnum() or "\u4e00" <= text[idx] <= "\u9fff"
+        ):
+            idx += 1
+        return text[idx:], idx > 0
+
+    def _block_header(self, line: str, names: tuple[str, ...]) -> tuple[str, str] | None:
+        """识别分块标题行，返回 (标题, 标题同行的正文)。
+
+        标题要么带修饰（emoji / # / ** / 括号），要么后面紧跟冒号，否则不算标题——
+        否则「核查结果与资料一致」「调侃地说…」这类正文会被误判成分块标题。
+        """
+        text, decorated = self._strip_decor(line.strip())
+# 短名（锐评/调侃）带正文时必须带修饰，完整标题名（锐评调侃）才允许直接跟冒号
+        for pos, name in enumerate(names):
+            if not text.startswith(name):
+                continue
+# 冒号要在 strip_decor 之前判断，否则「调侃：…」的冒号会被剥掉从而被当成标题
+            rest = text[len(name) :].strip()
+            if not rest:
+                return name, ""
+            if rest[0] in ":：":
+                # 短名（锐评/调侃）后直接跟正文时不算标题，否则「调侃：…」这类正文会被吞掉
+                if not (decorated or pos == 0):
+                    return None
+                inline = self._strip_decor(rest[1:].strip())[0].strip()
+                return name, inline.rstrip("*》】]\"'”’ ")
+            stripped, trailing = self._strip_decor(rest)
+            stripped = stripped.strip()
+            if not stripped:
+                return name, ""
+            if decorated or trailing:
+                return name, stripped
+            return None
+
+    def _strip_verdict_word(self, line: str) -> str:
+        """去掉行首判定词（可能带 emoji 等修饰），保留同行剩下的正文。"""
+        text, _ = self._strip_decor(line.strip())
+        match = re.match(
+            r"(?i)^(true|false|unknown|属实|不实|无法核实|无法确认|不确定|为真|为假|是假的|真的|假的)", text
+        )
+        if not match:
+            return line.strip()
+        rest = text[match.end() :]
+        return rest.lstrip("：:,，。.!！、;；）)]}*\"'“”‘’ \t").strip()
+
+    def _clean_explanation(self, lines: list[str]) -> str:
+# 只丢「整行就是英文判定词」的行；「属实。」这种一句式结论要保留，删掉会让核查块整个消失
+        """规整核查解释：去掉行首 Markdown/引用符修饰，只丢弃整行就是英文判定词的行。"""
+        kept: list[str] = []
+        for line in lines:
+            cleaned = self._strip_decor(line.strip())[0].strip()
+            if not cleaned:
+                continue
+            if re.fullmatch(r"(?i)(true|false|unknown)[.。!！]*", cleaned):
+                continue
+            kept.append(cleaned)
+        return "\n".join(kept).strip()
+
+# 规整调侃正文：去掉前缀与引号、合并单行，超长静默截断（不往群里发「已截断」）
+    def _clean_roast_text(self, text: str) -> str:
+# 多行合并：中文直接相连，两侧都是英文/数字时才补一个空格
+# 每行先去行首修饰，再按中英文规则合并
+        parts = [
+            self._strip_decor(line.strip())[0].strip() for line in text.splitlines()
+        ]
+        parts = [part for part in parts if part]
+        merged = ""
+        for part in parts:
+            if merged and part and merged[-1].isascii() and part[0].isascii():
+                merged += " "
+            merged += part
+        cleaned = merged
+        cleaned = re.sub(r"^(?:锐评调侃|锐评|点评|吐槽|调侃|回复)\s*[:：]\s*", "", cleaned)
+        cleaned = cleaned.strip().strip("`\"'“”‘’")
+        return cleaned if len(cleaned) <= 200 else cleaned[:200] + "…"
+
+    def _format_verdict(self, content: str) -> str:
+        verdict = self._detect_verdict(content)
+        if verdict is None:
+            return content
+
+        lines = content.strip().splitlines()
+        rest = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        if self._parse_verdict_token(lines[0].strip()) is None:
+            for line in lines[:4]:
+                if self._parse_verdict_token(line.strip()) is not None:
                     remaining = [ln for ln in lines if ln.strip() != line.strip()]
                     rest = "\n".join(remaining).strip()
                     break
-
-        if verdict is None:
-            lowered = content.lower()
-            if re.search(r"\bfalse\b|不实|为假|是假的|谣言", lowered):
-                verdict = "false"
-            elif re.search(r"\bunknown\b|无法(?:核实|确认|确定)|不确定|布吉岛", lowered):
-                verdict = "unknown"
-            elif re.search(r"\btrue\b|属实|为真|是真的", lowered):
-                verdict = "true"
-
-        if verdict is None:
-            return content
 
         label = {
             "true": self.true_label,

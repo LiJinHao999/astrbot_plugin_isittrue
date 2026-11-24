@@ -38,6 +38,25 @@
 
 展示文案可通过 `true_label` / `false_label` / `unknown_label` 自定义。
 
+输出按判定分块，`true` / `false` 出「核查结果 + 锐评调侃」两块，`unknown` 只出调侃一块（不再显示核查解释）。把 `unknown_roast_prompt` 留空则回到「判定 + 核查解释」的老样式。
+
+```
+✅ 真的喵
+
+📌 核查结果
+官方公告已确认这条消息属实，原文里的时间和价格都对得上。
+
+😏 锐评调侃
+这波居然是真的，可惜截图里的时间戳已经过期三天。
+```
+
+```
+⚠️ 布吉岛
+
+😏 锐评调侃
+这问题问得像在给数学定理投票，可惜连题干都没写完。
+```
+
 ### 示例
 
 - `@机器人 太阳从西边升起真的吗`
@@ -80,7 +99,14 @@
 | `max_forward_fetch` | 远程 get_forward_msg 次数（硬上限 20，含嵌套；重复 id 跳过） | 8 |
 | `max_forward_images` | 合并转发最多提取图片数（硬上限 20） | 8 |
 | `true_label` / `false_label` / `unknown_label` | 三态展示文案 | 真的喵 / 假的喵 / 布吉岛 |
+| `unknown_roast_prompt` | 核查后追加调侃/锐评的提示词：并进终判系统提示词，由同一次模型回复分块输出，`true`/`false` 出「📌 核查结果 + 😏 锐评调侃」两块，`unknown` 只出调侃一块；留空则关闭调侃、只显示核查解释 | 见默认值 |
 | `reply_quote_mode` | 判定结果如何指代被核查的消息：`quote` 引用触发消息 / `at` 只 @ 提问者 / `none` 纯文字 | `quote` |
+| `enable_emoji_reaction` | 贴表情提示：开始核查时给触发消息贴「处理中」表情，结束时换成判定结果对应的表情（仅 aiocqhttp 生效，其它平台自动跳过） | true |
+| `emoji_pick_random` | 表情列表有多个时随机取一个；关闭则依次贴整个列表（一条消息通常只有一个表情位，实际只有最后一个生效） | true |
+| `start_emoji_ids` | 开始核查时贴的表情 ID 列表（OneBot/QQ 表情 ID，66=思考中）；留空则不贴 | `[66]` |
+| `true_emoji_ids` / `false_emoji_ids` / `unknown_emoji_ids` | 判定 true / false / unknown 时分别贴的表情 ID 列表 | `[74]` / `[264]` / `[270]` |
+| `error_emoji_ids` | 核查失败（模型报错或未返回内容）时贴的表情 ID 列表；留空则失败时不贴结果表情 | `[]` |
+| `remove_start_emoji_on_end` | 结束时先撤掉开始表情，再贴结果表情 | true |
 | `system_prompt` | 事实核查系统提示词 | 见默认值 |
 
 ## 模型配置
@@ -177,6 +203,12 @@ astrbot_plugin_isittrue/
 ```
 
 ## 更新日志
+
+### v1.8.2
+
+- **feat**: 贴表情提示（移植自 astrbot_plugin_iamthinking）：开始核查时给触发消息贴「处理中」表情，结束核查时按判定 true / false / unknown 换贴对应表情；核查失败时可另配 `error_emoji_ids`
+- **feat**: 新增配置 `enable_emoji_reaction` / `emoji_pick_random` / `start_emoji_ids` / `true_emoji_ids` / `false_emoji_ids` / `unknown_emoji_ids` / `error_emoji_ids` / `remove_start_emoji_on_end`；`set_msg_emoji_like` 仅 aiocqhttp 支持，其它平台与私聊无法贴时自动跳过（只写日志）
+- **feat**: 新增配置 `unknown_roast_prompt`：这段调侃/锐评提示词并进终判系统提示词，由同一次模型回复按判定分块输出——`true`/`false` 出「📌 核查结果 + 😏 锐评调侃」两块，`unknown` 只出调侃一块、不再显示核查解释；内置默认毒舌提示词，留空则关闭调侃、只显示核查解释；模型没给调侃分块时自动退回「判定 + 核查解释」的老样式
 
 ### v1.8.1
 

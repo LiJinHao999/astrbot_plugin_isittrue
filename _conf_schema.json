@@ -266,6 +266,12 @@
     "hint": "模型返回 unknown 时展示",
     "default": "⚠️ 布吉岛"
   },
+"unknown_roast_prompt": {
+"description": "核查后追加的调侃/锐评提示词",
+    "type": "text",
+    "hint": "会并进终判系统提示词，由同一次模型回复按判定分块输出：true/false 是「📌 核查结果 + 😏 锐评调侃」两块，unknown 只输出调侃一块；留空则关闭调侃、只显示核查解释。",
+    "default": "你是群聊里的毒舌评论员，会在给出核查结论后补一段调侃。\n1. 只针对观点本身和它的离谱程度下嘴，不要复述核查过程、不要罗列证据，也不要写「无法核实」「缺乏信息」「建议查证」这类话。\n2. 属实就调侃「居然是真的」或观点里想当然的地方；不实就调侃它假得多明目张胆、编得多用心；无法核实就调侃这种既没法证实也没法证伪的说法有多没信息量。\n3. 可以阴阳怪气、打比方、用网络梗，但不得人身攻击群友、不用脏话、不涉及敏感话题，不编造事实当依据。\n4. 中文，不超过 80 字，一到两句话；不要 Markdown、引号堆砌或表情符号。"
+  },
   "reply_quote_mode": {
     "description": "判定结果如何指代被核查的消息",
     "type": "string",
@@ -276,6 +282,54 @@
       "none"
     ],
     "default": "quote"
+  },
+"enable_emoji_reaction": {
+    "description": "贴表情提示核查进度",
+    "type": "bool",
+    "hint": "仅 aiocqhttp（OneBot/QQ）生效：开始核查时给触发消息贴「处理中」表情，核查结束时按判定结果换成对应表情，其它平台自动跳过",
+    "default": true
+  },
+  "emoji_pick_random": {
+    "description": "多个表情时随机取一个",
+    "type": "bool",
+    "hint": "从对应表情列表里随机抽一个贴上；关闭则依次贴整个列表（一条消息通常只有一个回应位，实际只有最后一个生效）",
+    "default": true
+  },
+  "start_emoji_ids": {
+    "description": "开始核查表情 ID 列表",
+    "type": "list",
+    "hint": "开始核查时贴上的表情（OneBot/QQ 表情 ID，默认 66=思考中）。留空则不贴",
+    "default": [66]
+  },
+  "true_emoji_ids": {
+    "description": "判定为真实时的表情 ID 列表",
+    "type": "list",
+    "hint": "判定 true 时贴上的表情（默认 74=赞）",
+    "default": [74]
+  },
+  "false_emoji_ids": {
+    "description": "判定为虚假时的表情 ID 列表",
+    "type": "list",
+    "hint": "判定 false 时贴上的表情（默认 264=捂脸）",
+    "default": [264]
+  },
+  "unknown_emoji_ids": {
+    "description": "判定为无法核实时表情 ID 列表",
+    "type": "list",
+    "hint": "判定 unknown 时贴上的表情（默认 270=emm）",
+    "default": [270]
+  },
+  "error_emoji_ids": {
+    "description": "核查失败时的表情 ID 列表",
+    "type": "list",
+    "hint": "模型报错或未返回内容时贴上的表情。留空则失败时不贴结束表情（仍会撤掉开始表情）",
+    "default": []
+  },
+  "remove_start_emoji_on_end": {
+    "description": "结束时撤掉开始表情",
+    "type": "bool",
+    "hint": "关闭后开始表情会一直保留，再叠加结束表情",
+    "default": true
   },
   "system_prompt": {
     "description": "事实核查系统提示词（终判）",
