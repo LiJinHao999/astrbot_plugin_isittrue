@@ -25,7 +25,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.3"
+PLUGIN_VERSION = "1.8.4"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -41,11 +41,15 @@ DEFAULT_ROAST_PROMPT = (
     "不编造事实当依据。\n"
     "4. 中文，不超过 80 字，一到两句话；不要 Markdown、引号堆砌或表情符号。"
 )
-# 判定结果分块展示：true/false 出「核查结果 + 锐评调侃」两块，unknown 只出调侃一块
+# 判定结果分块展示：true/false 出「核查结果 + 锐评调侃」，unknown 先出「未判定原因」再出调侃
 VERDICT_CHECK_HEADER = "📌 核查结果"
 VERDICT_ROAST_HEADER = "😏 锐评调侃"
+VERDICT_REASON_HEADER = "📝 未判定原因"
 VERDICT_CHECK_NAMES = ("核查结果",)
 VERDICT_ROAST_NAMES = ("锐评调侃", "锐评", "调侃")
+# 原因块和核查块同属「非调侃」桶；别名兼容模型自己换的说法
+VERDICT_REASON_NAMES = ("未判定原因", "判定原因", "原因")
+VERDICT_NON_ROAST_NAMES = VERDICT_CHECK_NAMES + VERDICT_REASON_NAMES
 # 贴表情（移植自 astrbot_plugin_iamthinking）：OneBot/QQ 表情 ID
 # 66=思考中，74=赞/完成，264=捂脸，270=emm
 DEFAULT_START_EMOJI_IDS = (66,)
@@ -1462,12 +1466,14 @@ class IsItTrue(Star):
         if self.unknown_roast_prompt:
             parts.append(
                 "【输出】第一行只写 true/false/unknown；之后按系统要求的分块格式输出："
-                "true/false 先写核查结果、再写调侃；unknown 只写调侃，不写核查解释。"
+                "true/false 先写核查结果、再写调侃；"
+                "unknown 先写「未判定原因」（一句话说清为什么判不了）、再写调侃。"
             )
         else:
             parts.append(
                 "【输出】第一行 true/false/unknown；第二行起中文解释（200字以内）。"
                 "先点明判定对象，再写关键原因和机制。"
+                "unknown 时先说明为什么判不了（信息不足、涉及私人信息、说法主观、资料矛盾），再写其它。"
             )
         return "\n".join(parts)
 
@@ -1536,17 +1542,19 @@ class IsItTrue(Star):
             return ""
         return (
             "\n\n【输出格式】第一行只写判定词 true / false / unknown，不要写多余内容。\n"
-            "判定词之后的核查解释写两到三句，不要罗列检索过程，也不要编造来源。\n"
+            "判定词之后的核查解释（true/false）写两到三句，不要罗列检索过程，也不要编造来源。\n"
             "判定为 true 或 false 时，判定词之后依次写两块：\n"
             f"{VERDICT_CHECK_HEADER}\n<两三句核查结论，写明依据，不要罗列检索步骤>\n\n"
             f"{VERDICT_ROAST_HEADER}\n<一段调侃，不超过 80 字，一到两句话>\n"
-            "判定为 unknown 时只写调侃一块：不要出现核查结果标题，也不要写核查解释。\n"
-            "分块标题必须原样保留；除这两块标题外不要使用其它 Markdown 标题。\n"
+            "判定为 unknown 时写两块：先写「未判定原因」一块，一句话说清为什么判不了\n"
+            "（信息不足、查不到可信资料；涉及私人信息、无法公开核实；说法主观、没法用事实证伪；"
+            "资料互相矛盾），不要罗列检索过程，也不要出现核查结果标题；再写调侃一块。\n"
+            "分块标题必须原样保留（以「核查结果」「未判定原因」「锐评调侃」为准）；除上述标题外不要使用其它 Markdown 标题。\n"
             "【调侃要求】\n"
             f"{prompt}"
         )
 
-# 分块解析：标题容忍 Markdown 加粗/引用符/任意 emoji，true/false 出两块，unknown 只留调侃
+# 分块解析：标题容忍 Markdown 加粗/引用符/任意 emoji，true/false 出两块，unknown 出原因 + 调侃
     def _compose_verdict_content(self, verdict: str, content: str) -> str:
         if not self.unknown_roast_prompt:
             return content
@@ -1563,10 +1571,18 @@ class IsItTrue(Star):
         explanation = self._clean_explanation(check_lines)
         roast = self._clean_roast_text("".join(roast_lines))
         if verdict == "unknown":
+            reason = self._clean_reason(explanation)
             if not roast:
-                # 模型没给调侃块时只回显判定与正文，不补核查结果标题
-                return f"unknown\n{explanation}" if explanation else content
-            return f"unknown\n{VERDICT_ROAST_HEADER}\n{roast}"
+                # 模型没给调侃块时保留原因，不补调侃标题
+                if reason:
+                    return f"unknown\n{VERDICT_REASON_HEADER}\n{reason}"
+                return content
+            if not reason:
+                return f"unknown\n{VERDICT_ROAST_HEADER}\n{roast}"
+            return (
+                f"unknown\n{VERDICT_REASON_HEADER}\n{reason}\n\n"
+                f"{VERDICT_ROAST_HEADER}\n{roast}"
+            )
         if not roast:
             return f"{verdict}\n{explanation}" if explanation else content
         if not explanation:
@@ -1576,6 +1592,15 @@ class IsItTrue(Star):
             f"{VERDICT_ROAST_HEADER}\n{roast}"
         )
 
+    @staticmethod
+    def _clean_reason(text: str) -> str:
+        """unknown 的原因：合并成一句，超长静默截断到 120 字（不发截断提示）。"""
+        merged = re.sub(r"\s*\n\s*", "", (text or "").strip())
+        merged = re.sub(r"\s+", " ", merged).strip()
+        if len(merged) > 120:
+            merged = merged[:120].rstrip("，,；;、 ") + "…"
+        return merged
+
     def _split_reply_blocks(self, lines: list[str]) -> tuple[list[str], list[str]]:
         """按两个分块标题切出（核查结果正文, 调侃正文）；标题顺序颠倒也能正确归类。"""
         check_at: int | None = None
@@ -1584,7 +1609,7 @@ class IsItTrue(Star):
         roast_inline = ""
         for idx, line in enumerate(lines):
             if check_at is None:
-                hit = self._block_header(line, VERDICT_CHECK_NAMES)
+                hit = self._block_header(line, VERDICT_NON_ROAST_NAMES)
                 if hit is not None:
                     check_at, check_inline = idx, hit[1]
                     continue
@@ -1603,7 +1628,7 @@ class IsItTrue(Star):
                 owner = "roast"
                 continue
 # 重复出现的标题行不再往正文里塞
-            if self._block_header(line, VERDICT_CHECK_NAMES) or self._block_header(
+            if self._block_header(line, VERDICT_NON_ROAST_NAMES) or self._block_header(
                 line, VERDICT_ROAST_NAMES
             ):
                 continue
