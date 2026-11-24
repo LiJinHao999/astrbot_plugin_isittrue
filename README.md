@@ -8,6 +8,35 @@
 
 本仓库基于上游 [konley/astrbot_plugin_isittrue](https://github.com/konley/astrbot_plugin_isittrue) v1.6.1 维护，在其之上集成了自定义 LLM 接入与本 README「更新日志」中列出的改动。
 
+## 相对上游原仓库的改进
+
+本仓库以 [konley/astrbot_plugin_isittrue](https://github.com/konley/astrbot_plugin_isittrue) **v1.6.1** 为基线，以下为相对上游新增或调整的能力；逐版本细节见文末「更新日志」。
+
+**模型接入**
+
+- 新增 `llm_source`：在 AstrBot 已配置模型（`astrbot_provider`）与自定义 OpenAI 兼容 API（`custom_api`）之间切换。
+- 自定义 API 支持 `custom_base_url` / `custom_api_key` / `custom_model` / `custom_api_timeout`，文本与 `image_url` 多模态；本地路径、`file://`、`base64://` 图片统一转成 `data:image/...;base64,...`，修复自定义端点下的 `invalid_image`。
+- `provider_id` 改为 AstrBot 原生模型选择器；`provider_fallbacks` 仅在 AstrBot 模式生效，自定义模式不会把请求转给其它服务。
+- 可选 `test_llm_on_startup`：加载/重载时真实发一次最小请求检查连通性，失败只写日志、不阻止加载。
+- 系统提示词额外注入本次核查的本地时间戳，约束时效事实判断。
+
+**联网搜索**
+
+- 新增 `grok_search` 渠道（移植 GrokSearch-rs 思路）：请求携带 `web_search` / `x_search` 工具，一次调用同时返回答案正文与来源。
+- 支持 `responses`（xAI 原生）与 `chat_completions`（OpenAI 兼容网关）两种传输；来源解析兼容 `output_text`、annotations、citations 等多种字段，并以正文 `[[n]](url)` 兜底，按 URL 去重；独立 `grok_search_timeout`；未配置 Key 自动跳过，`auto` 模式排在最后兜底。
+
+**判定结果呈现**
+
+- 分块输出：`true` / `false` 返回「📌 核查结果 + 😏 锐评调侃」，`unknown` 只返回「😏 锐评调侃」；`unknown_roast_prompt` 留空即回到「判定 + 核查解释」样式，模型未按格式输出时也自动回退旧样式。
+- 新增 `reply_quote_mode`（`quote` / `at` / `none`）：默认引用触发消息，拿不到消息 ID 时退回 @ 提问者；回复不再附加「来源：<模型名>」，模型名仅写日志。
+- 新增贴表情提示（移植 astrbot_plugin_iamthinking）：开始核查贴「处理中」表情，结束按 true / false / unknown / 失败换贴对应表情；仅 aiocqhttp 生效，其它平台自动跳过。
+- 判定解析增强：无首行判定词时，从回复前几行和核查块中识别信号，多个信号按出现位置取最早，避免解释文字把判定带偏。
+
+**工程**
+
+- 新增 `tests/test_custom_llm.py`、`tests/test_grok_search.py`。
+- `metadata.yaml` 更新为本仓库地址与版本号。
+
 ## 触发方式
 
 插件按以下优先级判断是否触发（命中即停）。触发词由 `trigger_phrases` 配置，默认是 `真的吗`：
