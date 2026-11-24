@@ -26,7 +26,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.5"
+PLUGIN_VERSION = "1.8.6"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -1547,19 +1547,19 @@ class IsItTrue(Star):
         for comp in event.get_messages():
             if isinstance(comp, Reply):
                 quoted_id = str(getattr(comp, "id", "") or "").strip()
-# 引用同一条消息但追问不同（「这条后来澄清了吗？」）算不同请求：
-            # 待核正文、补充问题、引用图片都并进键里，避免同一被引消息下的不同说法共用结论
-            if quoted_id:
-                digest = self._request_fingerprint(
-                    [
-                        str(bundle.get("text") or "").strip(),
-                        str(bundle.get("supplement") or "").strip(),
-                    ]
-                    + [str(item) for item in (bundle.get("images") or [])]
-                )
-                if not digest:
-                    return f"quoted:{quoted_id}"
-                return f"quoted:{quoted_id}:{digest}"
+                # 引用同一条消息但追问不同（「这条后来澄清了吗？」）算不同请求：
+                # 待核正文、补充问题、引用图片都并进键里，避免同一被引消息下的不同说法共用结论
+                if quoted_id:
+                    digest = self._request_fingerprint(
+                        [
+                            str(bundle.get("text") or "").strip(),
+                            str(bundle.get("supplement") or "").strip(),
+                        ]
+                        + [str(item) for item in (bundle.get("images") or [])]
+                    )
+                    if not digest:
+                        return f"quoted:{quoted_id}"
+                    return f"quoted:{quoted_id}:{digest}"
 # 没有引用消息时用待核内容本身做键（同样先 strip：空白补充与没补充算同一个请求）
         digest = self._request_fingerprint(
             [
