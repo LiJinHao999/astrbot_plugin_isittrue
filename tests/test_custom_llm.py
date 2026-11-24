@@ -43,8 +43,19 @@ def _install_astrbot_stubs() -> None:
     api.logger = _Logger()
     event.AstrMessageEvent = type("AstrMessageEvent", (), {})
     event.filter = _Filter()
+    def _make_component(component_name):
+        """构造只记录参数的消息段桩，便于断言 Reply/At/Plain 的字段。"""
+
+        class _Component:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        _Component.__name__ = component_name
+        return _Component
     for name in ("At", "Forward", "Image", "Node", "Nodes", "Plain", "Reply"):
-        setattr(components, name, type(name, (), {}))
+        setattr(components, name, _make_component(name))
     star.Context = _Context
     star.Star = _Star
     star.register = _register
@@ -304,7 +315,7 @@ class PluginLLMSelectionTests(unittest.TestCase):
         self.assertEqual(plugin._llm_configuration_error(), "")
         self.assertEqual(plugin._resolve_providers(), [plugin.custom_llm])
 
-    def test_formats_result_with_actual_model_name(self):
+    def test_result_has_no_source_line(self):
         plugin = main.IsItTrue(
             _FakeContext(),
             {
@@ -315,9 +326,57 @@ class PluginLLMSelectionTests(unittest.TestCase):
         )
 
         model_name = plugin._provider_model_name(plugin.custom_llm)
-        result = plugin._format_result_with_source("true\n核查内容属实。", model_name)
+        result = plugin._format_verdict("true\n核查内容属实。")
 
-        self.assertEqual(result, "✅ 真的喵\n核查内容属实。\n来源：grok-4.5")
+        self.assertEqual(model_name, "grok-4.5")
+        self.assertEqual(result, "✅ 真的喵\n核查内容属实。")
+        self.assertNotIn("来源", result)
+
+    def test_result_chain_quotes_trigger_message(self):
+        plugin = main.IsItTrue(_FakeContext(), {})
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message_id="777"),
+            get_sender_id=lambda: "42",
+        )
+
+        chain = plugin._build_result_chain("true\n属实。", event)
+
+        self.assertIsInstance(chain[0], main.Reply)
+        self.assertEqual(chain[0].id, "777")
+        self.assertIsInstance(chain[1], main.Plain)
+        self.assertEqual(chain[1].text, "✅ 真的喵")
+
+    def test_result_chain_falls_back_to_at_without_message_id(self):
+        plugin = main.IsItTrue(_FakeContext(), {})
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(),
+            get_sender_id=lambda: "42",
+        )
+
+        chain = plugin._build_result_chain("true\n属实。", event)
+
+        self.assertIsInstance(chain[0], main.At)
+        self.assertEqual(str(chain[0].qq), "42")
+        self.assertIsInstance(chain[1], main.Plain)
+        self.assertTrue(chain[1].text.startswith(" ✅ 真的喵"))
+
+    def test_result_chain_respects_none_mode(self):
+        plugin = main.IsItTrue(_FakeContext(), {"reply_quote_mode": "none"})
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message_id="777"),
+            get_sender_id=lambda: "42",
+        )
+
+        chain = plugin._build_result_chain("true\n属实。", event)
+
+        self.assertEqual(len(chain), 1)
+        self.assertIsInstance(chain[0], main.Plain)
+        self.assertEqual(chain[0].text, "✅ 真的喵")
+
+    def test_unknown_quote_mode_falls_back_to_quote(self):
+        plugin = main.IsItTrue(_FakeContext(), {"reply_quote_mode": "bogus"})
+
+        self.assertEqual(plugin.reply_quote_mode, "quote")
 
     def test_prefers_astrbot_provider_model_name_over_provider_id(self):
         class _Provider:

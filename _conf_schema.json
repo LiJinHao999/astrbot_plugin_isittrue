@@ -266,6 +266,17 @@
     "hint": "模型返回 unknown 时展示",
     "default": "⚠️ 布吉岛"
   },
+  "reply_quote_mode": {
+    "description": "判定结果如何指代被核查的消息",
+    "type": "string",
+    "hint": "quote=引用触发它的那条消息（发「真的吗」的消息），拿不到消息 ID 时自动退回 at；at=只 @ 提问者；none=纯文字回复",
+    "options": [
+      "quote",
+      "at",
+      "none"
+    ],
+    "default": "quote"
+  },
   "system_prompt": {
     "description": "事实核查系统提示词（终判）",
     "type": "text",

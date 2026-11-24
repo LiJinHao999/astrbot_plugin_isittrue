@@ -24,11 +24,13 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.8.1"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
 DEFAULT_UNKNOWN_LABEL = "⚠️ 布吉岛"
+# 判定结果的指代方式：quote=引用触发消息，at=@ 提问者，none=不指代
+REPLY_QUOTE_MODES = ("quote", "at", "none")
 DEFAULT_MAX_SEARCH_QUERIES = 2
 # 联网搜索渠道（与 AstrBot 框架 provider_settings.websearch_provider 取值对齐）
 SEARCH_PROVIDER_OPTIONS = (
@@ -851,6 +853,11 @@ class IsItTrue(Star):
             ).strip()
             or DEFAULT_UNKNOWN_LABEL
         )
+        self.reply_quote_mode: str = (
+            str(config.get("reply_quote_mode", "quote") or "quote").strip().lower()
+        )
+        if self.reply_quote_mode not in REPLY_QUOTE_MODES:
+            self.reply_quote_mode = "quote"
         self.system_prompt: str = (
             str(
                 config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
@@ -1052,10 +1059,10 @@ class IsItTrue(Star):
         if not content:
             yield event.plain_result("模型未返回有效内容。")
             return
-
-        yield event.plain_result(
-            self._format_result_with_source(content, model_name)
+        logger.info(
+            f"{LOG_PREFIX} 判定完成 | 模型={model_name} degraded={degraded}"
         )
+        yield event.chain_result(self._build_result_chain(content, event))
 
     def _resolve_provider(self):
         if self.provider_id:
@@ -1358,12 +1365,35 @@ class IsItTrue(Star):
                 rest = "\n".join(rest_lines[1:]).strip()
         return f"{label}\n{rest}" if rest else label
 
-    def _format_result_with_source(self, content: str, model_name: str) -> str:
-        result = self._format_verdict(content)
-        safe_model_name = re.sub(r"[\r\n]+", " ", model_name or "").strip()[:120]
-        if not safe_model_name:
-            safe_model_name = "未知模型"
-        return f"{result}\n来源：{safe_model_name}"
+    def _build_result_chain(self, content: str, event) -> list:
+        """判定结果按 reply_quote_mode 引用触发消息或 @ 提问者。
+
+        群里只看一条判定结果常常分不清在核哪条消息，所以默认引用触发它的
+        那条消息（即发「真的吗」的那条）；引用拿不到消息 ID 时退回 @ 提问者。
+        """
+        text = self._format_verdict(content)
+        mode = self.reply_quote_mode
+        chain: list = []
+        if mode == "quote":
+            message_id = self._event_message_id(event)
+            if message_id:
+                chain.append(Reply(id=message_id))
+        if not chain and mode != "none":
+            user_id = str(event.get_sender_id() or "").strip()
+            if user_id:
+                chain.append(At(qq=user_id))
+                text = f" {text}"
+        chain.append(Plain(text=text))
+        return chain
+
+    @staticmethod
+    def _event_message_id(event) -> str:
+        """尽力取触发消息 ID，取不到就返回空串（调用方退回不引用）。"""
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", "") if message_obj else ""
+        if isinstance(message_id, int):
+            return str(message_id)
+        return message_id.strip() if isinstance(message_id, str) else ""
 
     @staticmethod
     def _parse_verdict_token(token: str) -> str | None:
