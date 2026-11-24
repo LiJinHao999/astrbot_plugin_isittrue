@@ -5,6 +5,24 @@
     "hint": "同一用户在该时间内重复触发会被拦截",
     "default": 10
   },
+  "max_concurrent": {
+    "description": "同时核查的最大数量",
+    "type": "int",
+    "hint": "超出的请求排队等待，可避免多群同时触发打满模型与搜索额度。默认 2，范围 1-10。",
+    "default": 2
+  },
+  "total_timeout": {
+    "description": "单次核查总超时（秒）",
+    "hint": "只算核查本身、不含排队等待，默认 900 秒（范围 30-1800）。注意搜索渠道会串行尝试：Grok 单条 query 最坏约 120×3 + 退避 ≈ 363 秒，用尽后再回退 Tavily（多 Key × 30 秒）、博查、百度 AI、Brave、Firecrawl、AnySearch 各约 35 秒，2 条 query 的现实上界可达 1300 秒以上，可酌情调大。",
+    "type": "int",
+    "default": 900
+  },
+  "check_cache_ttl": {
+    "description": "重复请求缓存时长（秒）",
+    "type": "int",
+    "hint": "同一引用消息或同一待核内容在该时间内重复触发时直接复用上次结论；填 0 关闭缓存（范围 0-3600）。只合并短时间的重复请求，避免用过时结论回答新问题。",
+    "default": 300
+  },
   "trigger_phrases": {
     "description": "检测触发词列表",
     "type": "list",
@@ -221,8 +239,26 @@
   "grok_search_timeout": {
     "description": "Grok 搜索超时（秒）",
     "type": "int",
-    "hint": "多 agent 搜索通常比普通搜索慢，默认 120 秒；超时由 search_timeout 之外单独控制",
+    "hint": "多 agent 搜索通常比普通搜索慢，默认 120 秒（下限 10、上限 120，超出的配置会被压到 120）；与普通搜索的 search_timeout 分开控制。",
     "default": 120,
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_retries": {
+    "description": "Grok 搜索重试次数",
+    "type": "int",
+    "hint": "首次请求之外的重试次数（默认 2，范围 0-5：默认即首次之外再试 2 次、最多请求 3 次；填 5 则最多请求 6 次）。仅对超时、网络异常、5xx 与 408/429/432 重试；其它 4xx（含 401/403 鉴权失败、404）直接放弃。每次仍受上面 120 秒上限约束。",
+    "default": 2,
+    "condition": {
+      "enable_web_search": true
+    }
+  },
+  "grok_search_fallback": {
+    "description": "Grok 失败后回退其它渠道",
+    "type": "bool",
+    "hint": "显式选择 grok_search 且重试用尽仍未取到结果时，按内置顺序回退其它已配置的搜索渠道（如 tavily）。auto 模式本身就会降级，无需开启。",
+    "default": true,
     "condition": {
       "enable_web_search": true
     }

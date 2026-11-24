@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import mimetypes
 import random
@@ -25,7 +26,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.4"
+PLUGIN_VERSION = "1.8.5"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -201,8 +202,216 @@ def _grok_dedupe_sources(sources: list[dict[str, str]]) -> None:
         seen.add(url)
         kept.append(src)
     sources[:] = kept
+# 判定词表：行首解析、去词、正文兜底共用同一份，避免三处词表各自漂移
+# （曾出现「假的喵」被判 unknown：解析词表认不出「假的」，剥词又把「喵」漏进正文）
+VERDICT_ALIASES: dict[str, tuple[str, ...]] = {
+    "true": ("true", "属实", "为真", "是真的", "真的", "真"),
+    "false": ("false", "不属实", "不实", "为假", "是假的", "假的", "假"),
+    "unknown": (
+        "unknown",
+        "无法核实",
+        "无法确认",
+        "无法确定",
+        "不确定",
+        "布吉岛",
+        "未知",
+    ),
+}
+# 正文兜底信号：只用长词（单字「真/假」、口语「真的/假的」在解释里误判率高），
+# 并加否定守卫——「并不属实」不能读成 true，「并非谣言」不能读成 false
+VERDICT_SIGNAL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "true": (
+        "true",
+        "(?<!不)属实",
+        "(?<!不)为真",
+        "(?<!不)(?<!非)是真的",
+        "(?:并非|不是|绝非)(?:谣言|是假的|假的|为假)",
+    ),
+    "false": (
+        "false",
+# 「不属实」不是「不实」的子串（中间隔着「属」），必须单独列
+        "不属实",
+# 「不是真的」「假消息」是很常见的口语否定，不比「不实」弱
+        "不实",
+        "不是真的",
+        "假消息",
+        "假新闻",
+        "为假",
+        "是假的",
+        "(?<!不是)(?<!并非)(?<!绝非)假的",
+        "(?<!并非)(?<!不是)(?<!绝非)谣言",
+    ),
+    "unknown": (
+        "unknown",
+        "无法核实",
+        "无法确认",
+        "无法确定",
+        "不确定",
+        "布吉岛",
+        "未知",
+    ),
+}
+
+
+# 判定词后允许残留的语气词（模型常写「真的喵」「假的喵」）
+# 「吗/么/嘛」不算：那是疑问语气词，「真的吗」是提问不是判定，不能被读成 true
+VERDICT_TAIL_FILLER = frozenset("喵呢啊吧哦呀了哟啦诶唉喔哈的")
+_VERDICT_FILLER_CHARS = "".join(sorted(VERDICT_TAIL_FILLER))
+# 判定词后出现这些分隔符时，后面一律算正文（「true 这是编造的」）
+VERDICT_TAIL_BREAKS = frozenset(
+    " \t\n:：,，。.!！;；、-—|~～（(【[《<*\"'“”‘’"
+)
+# 按词长降序，保证「是真的」先于「真」、「假的」先于「假」
+_VERDICT_ALIAS_BY_LENGTH: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        (
+            (alias, verdict)
+            for verdict, aliases in VERDICT_ALIASES.items()
+            for alias in aliases
+        ),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+)
+
+
+def _strip_leading_decor(text: str) -> str:
+    """去掉行首的 Markdown / emoji / 括号修饰（「✅ 真的」也要能认）。"""
+    idx = 0
+    while idx < len(text) and not (
+        text[idx].isalnum() or "\u4e00" <= text[idx] <= "\u9fff"
+    ):
+        idx += 1
+    return text[idx:]
+
+
+def _normalize_verdict_line(text: str) -> str:
+    """剥掉判定行开头的修饰、列表序号与「结论：」类前缀。"""
+    cleaned = _strip_leading_decor(text.strip().strip("`\"'“”‘’"))
+    cleaned = re.sub(r"^[\s#*：:\-\d\.\)\]]+", "", cleaned).strip()
+# 大小写不敏感：「Verdict: unknown」「ANSWER: UNKNOWN」也要剥掉，否则脏前缀会漏进未判定原因
+    return re.sub(
+        r"^(判定|结论|结果|答案|verdict|answer)\s*[:：\-]?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _verdict_filler_only(text: str) -> bool:
+    """判定词后只剩语气词 / 标点 / emoji 时视为没有正文。"""
+    return all(
+        ch in VERDICT_TAIL_FILLER
+        or not (ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+        for ch in text
+    )
+
+
+def _match_verdict_alias(text: str) -> tuple[str | None, str]:
+    """按统一词表匹配行首判定词，返回 (verdict, 剩余文本)；不匹配返回 (None, 原文)。
+
+    长词优先；词后跟分隔符算正文，只剩语气词/标点/emoji 也算匹配——
+    这样「真的喵」判 true，「真实的说法」不会被单字「真」误吞。
+    """
+    text = _strip_leading_decor(text)
+    lowered = text.lower()
+    for alias, verdict in _VERDICT_ALIAS_BY_LENGTH:
+        if not lowered.startswith(alias):
+            continue
+# 判定词与正文写在同一行时（「真的喵，官方已公告」），跳过语气词后再找分隔符
+        rest = text[len(alias) :]
+        if not rest or _verdict_filler_only(rest):
+            return verdict, rest
+        body = rest.lstrip(_VERDICT_FILLER_CHARS)
+        if body and body[0] in VERDICT_TAIL_BREAKS:
+            return verdict, body
+    return None, text
+def _verdict_signal_pattern(patterns: tuple[str, ...]) -> str:
+    """把兜底信号拼成正则：英文加词边界，中文排除疑问尾（「属实吗」不算断言）。
+
+    纯文字片段按字面转义；已写成正则的片段（带否定守卫）原样保留。
+    """
+    parts = []
+    for pattern in patterns:
+        if pattern.isascii():
+            parts.append(rf"\b{re.escape(pattern)}\b")
+        elif re.fullmatch(r"[A-Za-z\u4e00-\u9fff0-9]+", pattern):
+            parts.append(re.escape(pattern) + r"(?!吗|么|嘛)")
+        else:
+            parts.append(pattern + r"(?!吗|么|嘛)")
+    return "|".join(parts)
+# 带这些词的分句在说「谁说的 / 有没有证据」，不是结论：里面的判定词不能当判定
+_UNRELIABLE_SIGNAL_MARKERS: tuple[str, ...] = (
+    "据说",
+    "据称",
+    "声称",
+    "曾说过",
+    "曾说",
+    "他说",
+    "她说",
+    "传言",
+    "传闻",
+    "听说",
+    "否认",
+    "没有证据",
+    "没有资料",
+    "没有任何",
+    "无法证明",
+    "无法证实",
+    "未证实",
+    "未经证实",
+    "没有确认",
+    "未确认",
+)
+
+
+def _mask_unreliable_clauses(text: str) -> str:
+    """把「据说…」「没有证据表明…」「…但官方否认」这类分句抹成等长空白。
+
+    兜底信号只看能定结论的分句，避免把「据说这是真的」「没有证据表明这是谣言」
+    「目前无法证明它为真」读成 true/false；抹成等长空白是为了不挪动其它信号的位置。
+    """
+    # 转折词也算分句边界：「他说这是真的但视频是假消息」两边要分开判
+    parts = re.split(r"([，。；：！？,;:!?~\n]|但|然而|不过|可是)", text)
+    masked: list[str] = []
+    for index in range(0, len(parts), 2):
+        clause = parts[index]
+        separator = parts[index + 1] if index + 1 < len(parts) else ""
+        if any(marker in clause for marker in _UNRELIABLE_SIGNAL_MARKERS):
+            clause = " " * len(clause)
+        masked.append(clause + separator)
+    return "".join(masked)
+def _config_int(config: Any, key: str, default: int, low: int, high: int) -> int:
+    """取整型配置：缺省/显式 None/非法值都退回默认，再夹到 [low, high]。
+
+    不用 `config.get(key, default) or default`：那样传 0 会被当成没配，
+    而 None 又被当成「用户想要 0」。
+    """
+    raw = config.get(key, default)
+    if raw is None:
+        raw = default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(high, max(low, value))
+
+
+def _config_bool(config: Any, key: str, default: bool) -> bool:
+    """取布尔配置：None 退回默认，字符串 "false"/"0"/"no"/"off"/"" 视为 False。
+
+    直接 bool("false") 是 True，配置里写成字符串会静默反转开关。
+    """
+    raw = config.get(key, default)
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"false", "0", "no", "off", ""}
+    return bool(raw)
 # Tavily 等 Key 相关失败状态码：换下一个 Key 重试
 _RETRYABLE_HTTP_STATUSES = frozenset({401, 403, 429, 432})
+# Grok 重试只认瞬时故障：401/403 是 Key/权限问题，重试不会变好（Tavily 那套 401/403 是为了换 Key）
+_GROK_RETRYABLE_STATUSES = frozenset({408, 429, 432})
 # 框架/客户端常见图片占位，不能当有效待核文本或搜索词
 _IMAGE_PLACEHOLDER_RE = re.compile(
     r"^\s*(?:"
@@ -719,9 +928,10 @@ class IsItTrue(Star):
         super().__init__(context)
         config = config or {}
         self.cooldown: int = max(0, int(config.get("cooldown", 10) or 0))
-        self.listen_suffix: bool = bool(config.get("listen_suffix", False))
-        self.listen_prefix: bool = bool(config.get("listen_prefix", False))
-        self.enable_vision: bool = bool(config.get("enable_vision", True))
+# 字符串 "false" 也要当成关闭：直接 bool("false") 是 True
+        self.listen_suffix: bool = _config_bool(config, "listen_suffix", False)
+        self.listen_prefix: bool = _config_bool(config, "listen_prefix", False)
+        self.enable_vision: bool = _config_bool(config, "enable_vision", True)
         self.llm_source: str = (
             str(config.get("llm_source", "astrbot_provider") or "astrbot_provider")
             .strip()
@@ -760,7 +970,8 @@ class IsItTrue(Star):
         self.group_blacklist: set[str] = self._parse_id_set(
             config.get("group_blacklist", [])
         )
-        self.enable_web_search: bool = bool(config.get("enable_web_search", False))
+# 开关统一走 _config_bool：字符串 "false" 不能被当成开启
+        self.enable_web_search: bool = _config_bool(config, "enable_web_search", False)
         self.search_provider: str = (
             str(config.get("search_provider", "auto") or "auto").strip().lower()
         )
@@ -790,19 +1001,16 @@ class IsItTrue(Star):
         )
         if self.grok_search_transport not in GROK_SEARCH_TRANSPORTS:
             self.grok_search_transport = "responses"
-        self.grok_search_timeout: int = max(
-            10,
-            int(
-                config.get("grok_search_timeout", DEFAULT_GROK_SEARCH_TIMEOUT)
-                or DEFAULT_GROK_SEARCH_TIMEOUT
-            ),
+# 单次超时夹到 10-120s：填 0/负数/非数字都退回默认，别让插件在加载时抛 ValueError
+        self.grok_search_timeout: int = _config_int(
+            config, "grok_search_timeout", DEFAULT_GROK_SEARCH_TIMEOUT, 10, 120
         )
-        self.grok_search_web_search: bool = bool(
-            config.get("grok_search_web_search", True)
-        )
-        self.grok_search_x_search: bool = bool(
-            config.get("grok_search_x_search", False)
-        )
+# 重试次数 = 首次之外的重试次数：2 表示最多请求 3 次（0 表示不重试）
+        self.grok_search_retries: int = _config_int(config, "grok_search_retries", 2, 0, 5)
+        # Grok 重试仍失败/超时时，是否回退到其它已配置的搜索渠道
+        self.grok_search_fallback: bool = _config_bool(config, "grok_search_fallback", True)
+        self.grok_search_web_search: bool = _config_bool(config, "grok_search_web_search", True)
+        self.grok_search_x_search: bool = _config_bool(config, "grok_search_x_search", False)
         self.grok_search_system_prompt: str = str(
             config.get(
                 "grok_search_system_prompt", DEFAULT_GROK_SEARCH_SYSTEM_PROMPT
@@ -895,10 +1103,9 @@ class IsItTrue(Star):
         if self.reply_quote_mode not in REPLY_QUOTE_MODES:
             self.reply_quote_mode = "quote"
 # 贴表情提示（移植自 astrbot_plugin_iamthinking）：开始/结束核查时给触发消息贴表情
-        self.emoji_reaction_enabled: bool = bool(
-            config.get("enable_emoji_reaction", True)
-        )
-        self.emoji_pick_random: bool = bool(config.get("emoji_pick_random", True))
+# 开关统一走 _config_bool：字符串 "false" 不能被当成开启
+        self.emoji_reaction_enabled: bool = _config_bool(config, "enable_emoji_reaction", True)
+        self.emoji_pick_random: bool = _config_bool(config, "emoji_pick_random", True)
         self.start_emoji_ids: list[int] = self._as_int_list(
             config.get("start_emoji_ids", list(DEFAULT_START_EMOJI_IDS))
         )
@@ -931,6 +1138,17 @@ class IsItTrue(Star):
             or DEFAULT_PLAN_PROMPT
         )
         self._cooldowns: dict[str, float] = {}
+# 并发与整体超时：防止多群同时触发把模型/搜索额度打满，或单次核查无限挂起
+# 默认 900s 的来历：Grok 单条 query 最坏 ≈ 120×3 + 退避 ≈ 363s，auto 模式默认 2 条 query
+# 串行 ≈ 726s，再加规划/终判两次 LLM 调用；旧默认 480s 必然先中止、把已搜到的资料全丢掉
+# 整型配置统一走 _config_int：None/0/超范围都按文档语义处理
+        self.max_concurrent: int = _config_int(config, "max_concurrent", 2, 1, 10)
+        self.total_timeout: int = _config_int(config, "total_timeout", 900, 30, 1800)
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        # 请求级缓存：只合并「同一引用消息 ID / 同一待核内容」的短时间重复请求
+        self.check_cache_ttl: int = _config_int(config, "check_cache_ttl", 300, 0, 3600)
+        self._result_cache: dict[str, tuple[float, str]] = {}
+        self._RESULT_CACHE_MAX = 200
 # ==== 贴表情提示（移植自 astrbot_plugin_iamthinking）====
     @staticmethod
     def _as_int_list(value: Any) -> list[int]:
@@ -1074,6 +1292,73 @@ class IsItTrue(Star):
             yield event.plain_result(f"检测冷却中，请 {remain} 秒后再试。")
             return
 
+# 冷却在入队前就占位：排队期间同一用户再次触发会被挡住，避免连击把队列堆满
+        self._cooldowns[user_id] = now
+# 记录是否真的贴过「处理中」表情：排队中被取消的请求不该去撤一个不存在的表情
+        emoji_state = {"started": False}
+# 具体核查放进 _verify：async generator 不能直接包进 wait_for，交给 _run_check 包一层
+# total_timeout 只算核查本身，排队时间不算，免得排了半天的请求刚开工就被判超时
+        started = time.monotonic()
+        try:
+            results = await self._run_check(event, strip_keyword, emoji_state)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{LOG_PREFIX} 核查整体超时：>{self.total_timeout}s "
+                f"elapsed={time.monotonic() - started:.1f}s user={user_id}"
+            )
+            # 中止的请求不吃冷却：提示语让用户「稍后重试」，不能让他立刻又撞冷却
+            self._cooldowns.pop(user_id, None)
+            await self._finish_emoji(event, "error")
+            yield event.plain_result(
+                f"核查超过 {self.total_timeout} 秒仍未完成，已中止；"
+                "可调小搜索/超时配置，或稍后重试。"
+            )
+            return
+# 插件重载/停机时上游会取消任务（CancelledError 是 BaseException，下面的 except 抓不到）：
+            # 撤掉「处理中」表情并把冷却退回，再把取消继续往上抛；
+            # 排队中被取消的请求还没开工、也没贴过表情，别去撤一个不存在的表情
+        except asyncio.CancelledError:
+            self._cooldowns.pop(user_id, None)
+            if emoji_state["started"]:
+                try:
+                    await self._finish_emoji(event, "error")
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"{LOG_PREFIX} 核查异常：{e}")
+            # 出错同样不吃冷却：这是插件侧失败，不该罚用户等
+            self._cooldowns.pop(user_id, None)
+            await self._finish_emoji(event, "error")
+            yield event.plain_result(self._friendly_error(str(e)))
+            return
+        for result in results:
+            yield result
+
+    async def _run_check(
+# 排队中的请求也要能拿到 emoji_state，才能判断自己有没有贴过「处理中」表情
+        self,
+        event: AstrMessageEvent,
+        strip_keyword: str,
+        emoji_state: dict[str, bool],
+    ) -> list[Any]:
+        """在并发上限内跑完一次核查，返回待发送的结果对象列表。"""
+# 并发闸门：wait_for 放在闸门内，排队时间不算进 total_timeout
+        async with self._semaphore:
+            # 超时只算核查本身：排队等待不该占用 total_timeout
+            return await asyncio.wait_for(
+                self._verify(event, strip_keyword, emoji_state),
+                timeout=self.total_timeout,
+            )
+
+# emoji_state 由 handle_message 传入：被取消时要判断这个请求有没有贴过「处理中」表情
+    async def _verify(
+        self,
+        event: AstrMessageEvent,
+        strip_keyword: str,
+        emoji_state: dict[str, bool] | None = None,
+    ) -> list[Any]:
+        """核查主体：提取 → 规划 → 搜索 → 终判 → 组装结果（不负责发送）。"""
         bundle = await self._extract_bundle(event, strip_keyword)
         raw_text = bundle["text"]
         images = bundle["images"]
@@ -1090,17 +1375,34 @@ class IsItTrue(Star):
             f"supplement_len={len(supplement)} note={image_note!r}"
         )
 
+# 空内容不算一次核查：把入队时占的冷却退回，用户能立刻补一句
         if not text and not images and not supplement:
-            return
+            self._cooldowns.pop(str(event.get_sender_id() or ""), None)
+            # 别让「@我 真的吗」石沉大海：告诉用户该怎么用
+            return [
+                event.plain_result(
+                    "请 @我 并说明要核实的内容，或引用一条消息再发「真的吗」。"
+                )
+            ]
 
         llm_error = self._llm_configuration_error()
         if llm_error:
-            yield event.plain_result(llm_error)
-            return
+            # 没配模型是插件侧问题，同样退回冷却
+            self._cooldowns.pop(str(event.get_sender_id() or ""), None)
+            return [event.plain_result(llm_error)]
 
-        self._cooldowns[user_id] = now
 # 开始核查：给触发消息贴「处理中」表情（非 aiocqhttp / 不支持表情时自动跳过）
+        if emoji_state is not None:
+            emoji_state["started"] = True
         await self._start_emoji(event)
+
+# 请求级缓存：同一引用消息 ID / 同一待核内容在 TTL 内重复触发，直接复用上次结论
+        cache_key = self._cache_key(event, bundle)
+        cached = self._cached_content(cache_key)
+        if cached is not None:
+            logger.info(f"{LOG_PREFIX} 命中请求缓存 key={cache_key} len={len(cached)}")
+            await self._finish_emoji(event, self._detect_verdict(cached) or "unknown")
+            return [event.chain_result(self._build_result_chain(cached, event))]
 
         notes: list[str] = []
         if image_note:
@@ -1213,25 +1515,98 @@ class IsItTrue(Star):
             err_msg = str(e)
             logger.exception(f"{LOG_PREFIX} 全部模型回退链调用失败: {err_msg}")
             await self._finish_emoji(event, "error")
-            yield event.plain_result(self._friendly_error(err_msg))
-            return
+            return [event.plain_result(self._friendly_error(err_msg))]
 
         if not content:
             await self._finish_emoji(event, "error")
-            yield event.plain_result("模型未返回有效内容。")
-            return
+            return [event.plain_result("模型未返回有效内容。")]
+
 # 判定与调侃同一次输出：true/false 出「核查结果 + 锐评调侃」，unknown 只留调侃
-        verdict = self._detect_verdict(content) or "unknown"
+        verdict = self._detect_verdict(content)
+        if verdict is None:
+            logger.warning(
+                f"{LOG_PREFIX} 判定词未识别，按 unknown 处理：{content[:200]!r}"
+            )
+            verdict = "unknown"
         if self.unknown_roast_prompt:
             content = self._compose_verdict_content(verdict, content)
         logger.info(
             f"{LOG_PREFIX} 判定完成 | 模型={model_name} degraded={degraded}"
+            f" verdict={verdict}"
         )
-        await self._finish_emoji(
-            event, verdict
-        )
-        yield event.chain_result(self._build_result_chain(content, event))
+        await self._finish_emoji(event, verdict)
+# 只缓存查到定论的 true/false：unknown 多半是「暂时查不到」，结论会随新资料变化
+        if verdict in ("true", "false"):
+            self._store_cache(cache_key, content)
+        return [event.chain_result(self._build_result_chain(content, event))]
 
+    def _cache_key(self, event: AstrMessageEvent, bundle: dict[str, Any]) -> str:
+        """请求级缓存键：优先被引用消息 ID，取不到再用待核内容指纹。"""
+        if self.check_cache_ttl <= 0:
+            return ""
+        for comp in event.get_messages():
+            if isinstance(comp, Reply):
+                quoted_id = str(getattr(comp, "id", "") or "").strip()
+# 引用同一条消息但追问不同（「这条后来澄清了吗？」）算不同请求：
+            # 待核正文、补充问题、引用图片都并进键里，避免同一被引消息下的不同说法共用结论
+            if quoted_id:
+                digest = self._request_fingerprint(
+                    [
+                        str(bundle.get("text") or "").strip(),
+                        str(bundle.get("supplement") or "").strip(),
+                    ]
+                    + [str(item) for item in (bundle.get("images") or [])]
+                )
+                if not digest:
+                    return f"quoted:{quoted_id}"
+                return f"quoted:{quoted_id}:{digest}"
+# 没有引用消息时用待核内容本身做键（同样先 strip：空白补充与没补充算同一个请求）
+        digest = self._request_fingerprint(
+            [
+                str(bundle.get("text") or "").strip(),
+                str(bundle.get("supplement") or "").strip(),
+            ]
+            + [str(item) for item in (bundle.get("images") or [])]
+        )
+        return f"content:{digest}" if digest else ""
+
+    @staticmethod
+    def _request_fingerprint(parts: list[str]) -> str:
+        """待核内容指纹：逐段带长度前缀，正文里带分隔符也不会两段拼成同一个串。"""
+        if not any(part.strip() for part in parts):
+            return ""
+        joined = "\x1f".join(f"{len(part)}:{part}" for part in parts)
+        return hashlib.sha1(joined.encode("utf-8", "ignore")).hexdigest()
+
+    def _cached_content(self, key: str) -> str | None:
+        """取未过期缓存；过期的顺手清掉，避免字典只涨不降。"""
+        if not key:
+            return None
+        entry = self._result_cache.get(key)
+        if entry is None:
+            return None
+        ts, content = entry
+        if time.time() - ts >= self.check_cache_ttl:
+            self._result_cache.pop(key, None)
+            return None
+        return content or None
+
+    def _store_cache(self, key: str, content: str) -> None:
+        if not key or not content or self.check_cache_ttl <= 0:
+            return
+        now = time.time()
+        self._result_cache[key] = (now, content)
+        if len(self._result_cache) <= self._RESULT_CACHE_MAX:
+            return
+        expired = [
+            k
+            for k, (ts, _content) in self._result_cache.items()
+            if now - ts >= self.check_cache_ttl
+        ]
+        for k in expired:
+            self._result_cache.pop(k, None)
+        while len(self._result_cache) > self._RESULT_CACHE_MAX:
+            self._result_cache.pop(next(iter(self._result_cache)))
     def _resolve_provider(self):
         if self.provider_id:
             provider = self.context.get_provider_by_id(self.provider_id)
@@ -1519,19 +1894,28 @@ class IsItTrue(Star):
         if verdict is None:
             head_lines = self._split_reply_blocks(lines)[0]
             lowered = "\n".join(head_lines).lower()
+            # 「真的假的？」是在问，不是断言：这个固定搭配先摘掉再看信号
+            lowered = lowered.replace("真的假的", "")
+# 归属句/缺证据句里的判定词不算结论（「据说这是真的」「没有证据表明这是谣言」）
+            lowered = _mask_unreliable_clauses(lowered)
             # 同时出现多个信号时按出现位置取最早的那个，避免 false 分支永远优先
+# 兜底信号从常量生成，避免再出现多份词表各自漂移
             signals = (
-                ("false", r"\bfalse\b|不实|为假|是假的|谣言"),
-                ("unknown", r"\bunknown\b|无法(?:核实|确认|确定)|不确定|布吉岛"),
-                ("true", r"\btrue\b|属实|为真|是真的"),
+                (name, _verdict_signal_pattern(patterns))
+                for name, patterns in VERDICT_SIGNAL_PATTERNS.items()
             )
-            best: tuple[int, str] | None = None
+            hits: dict[str, int] = {}
             for name, pattern in signals:
                 match = re.search(pattern, lowered)
-                if match is not None and (best is None or match.start() < best[0]):
-                    best = (match.start(), name)
-            if best is not None:
-                verdict = best[1]
+                if match is not None:
+                    hits[name] = match.start()
+            # 正反两方都能找到依据（「没有资料说它为真，也没证据说不实」）就不硬挑，
+            # 交给 unknown：宁可说不知道，也别把解释里的否定句读成正向结论
+            picked = [name for name, _pos in sorted(hits.items(), key=lambda kv: kv[1])]
+            if "true" in picked and "false" in picked:
+                verdict = None
+            elif picked:
+                verdict = picked[0]
         return verdict
 
 # 调侃要求并进终判系统提示词：同一次调用就输出「核查结果 + 锐评调侃」两块，不再单独调模型
@@ -1676,14 +2060,19 @@ class IsItTrue(Star):
 
     def _strip_verdict_word(self, line: str) -> str:
         """去掉行首判定词（可能带 emoji 等修饰），保留同行剩下的正文。"""
-        text, _ = self._strip_decor(line.strip())
-        match = re.match(
-            r"(?i)^(true|false|unknown|属实|不实|无法核实|无法确认|不确定|为真|为假|是假的|真的|假的)", text
-        )
-        if not match:
+        text = _normalize_verdict_line(line)
+# 与 _parse_verdict_token 共用同一份词表：剥掉判定词后只剩语气词/标点就清空
+        verdict, rest = _match_verdict_alias(text)
+        if verdict is None:
             return line.strip()
-        rest = text[match.end() :]
-        return rest.lstrip("：:,，。.!！、;；）)]}*\"'“”‘’ \t").strip()
+        rest = rest.lstrip("：:,，。.!！、-—–（(;；）)]}*\"'“”‘’ \t")
+        # 「unknown（资料不足）」被剥了左括号后，落单的右括号也一并去掉
+        closers = {"）": "（", ")": "(", "】": "【", "]": "[", "》": "《"}
+        while rest and rest[-1] in closers and closers[rest[-1]] not in rest:
+            rest = rest[:-1].rstrip()
+        if _verdict_filler_only(rest):
+            return ""
+        return rest.strip()
 
     def _clean_explanation(self, lines: list[str]) -> str:
 # 只丢「整行就是英文判定词」的行；「属实。」这种一句式结论要保留，删掉会让核查块整个消失
@@ -1778,49 +2167,9 @@ class IsItTrue(Star):
     def _parse_verdict_token(token: str) -> str | None:
         if not token:
             return None
-        cleaned = token.strip().strip("`\"'“”‘’").lower()
-        cleaned = re.sub(r"^[\s#*：:\-\d\.\)\]]+", "", cleaned).strip()
-        cleaned = re.sub(
-            r"^(判定|结论|结果|答案|verdict|answer)\s*[:：\-]?\s*",
-            "",
-            cleaned,
-        ).strip()
-        m = re.match(
-            r"^(true|false|unknown|属实|不实|无法核实|不确定|真|假)"
-            r"(?:\s|[（(【\[.,，。!！:：]|$)",
-            cleaned,
-        )
-        if m:
-            raw = m.group(1)
-            return {
-                "true": "true",
-                "false": "false",
-                "unknown": "unknown",
-                "属实": "true",
-                "不实": "false",
-                "无法核实": "unknown",
-                "不确定": "unknown",
-                "真": "true",
-                "假": "false",
-            }.get(raw)
-
-        compact = re.sub(r"[\s#*（）()【】\[\].,，。!！:：]", "", cleaned)
-        return {
-            "true": "true",
-            "false": "false",
-            "unknown": "unknown",
-            "属实": "true",
-            "为真": "true",
-            "真": "true",
-            "真的": "true",
-            "不实": "false",
-            "为假": "false",
-            "假": "false",
-            "假的": "false",
-            "无法核实": "unknown",
-            "不确定": "unknown",
-            "未知": "unknown",
-        }.get(compact)
+# 与 _strip_verdict_word 共用同一套归一化，避免「✅ 1. 真的」两处结论不一致
+        verdict, _rest = _match_verdict_alias(_normalize_verdict_line(token))
+        return verdict
 
     @classmethod
     def _is_image_placeholder(cls, text: str) -> bool:
@@ -2190,16 +2539,34 @@ class IsItTrue(Star):
         provider = self.search_provider
         if provider != "auto":
             try:
-                return await self._search_with(provider, query, event, claim)
+                result = await self._search_with(provider, query, event, claim)
+                if result:
+                    return result
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"{LOG_PREFIX} {provider} 搜索失败：{e}")
-                return ""
+# 显式指定 grok_search 但重试用尽仍失败/超时：回退其它渠道（可在配置里关闭）
+            if provider == "grok_search" and self.grok_search_fallback:
+                logger.info(f"{LOG_PREFIX} Grok 搜索未取到结果，回退其它搜索渠道")
+                return await self._search_fallback(query, event, claim, skip="grok_search")
+            return ""
 
+        return await self._search_fallback(query, event, claim)
+# 降级链：按 auto 顺序依次尝试，任一渠道返回非空即停止
+    async def _search_fallback(
+        self, query: str,
+        event: AstrMessageEvent | None = None,
+        claim: str = "",
+        skip: str = "",
+    ) -> str:
+        """依次尝试各渠道，`skip` 用于跳过刚失败过的渠道。"""
         last_err: Exception | None = None
         for cand in self._auto_search_order():
+            if cand == skip:
+                continue
             try:
                 result = await self._search_with(cand, query, event, claim)
                 if result:
+                    logger.info(f"{LOG_PREFIX} {cand} 搜索成功，已停止降级")
                     return result
                 logger.info(f"{LOG_PREFIX} {cand} 返回空结果，尝试下一渠道")
             except Exception as e:  # noqa: BLE001
@@ -2335,32 +2702,57 @@ class IsItTrue(Star):
             else self._grok_search_request(claim, query)
         )
         payload = self._grok_search_payload(prompt)
+# 单次超时 120s 封顶 + 失败重试；重试用尽后由上层降级到其它渠道
         timeout = aiohttp.ClientTimeout(total=self.grok_search_timeout)
+        attempts = self.grok_search_retries + 1
         logger.info(
             f"{LOG_PREFIX} Grok 搜索走 {self.grok_search_transport} 渠道：{url} "
-            f"model={self.grok_search_model}"
+            f"model={self.grok_search_model} attempts≤{attempts} "
+            f"timeout={self.grok_search_timeout}s"
         )
-        try:
-            async with (
-                aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
-                session.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {self.grok_search_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                ) as resp,
-            ):
-                if resp.status != 200:
+        data: Any = None
+        last_err = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                async with (
+                    aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
+                    session.post(
+                        url,
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {self.grok_search_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    ) as resp,
+                ):
+                    if resp.status == 200:
+                        data = await resp.json()
+                        break
                     reason = (await resp.text())[:200]
-                    logger.warning(
-                        f"{LOG_PREFIX} Grok 搜索 HTTP {resp.status}: {reason}"
+                    last_err = f"HTTP {resp.status}: {reason}"
+                    retryable = (
+                        resp.status in _GROK_RETRYABLE_STATUSES or resp.status >= 500
                     )
-                    return ""
-                data = await resp.json()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{LOG_PREFIX} Grok 搜索失败：{e}")
+                    logger.warning(
+                        f"{LOG_PREFIX} Grok 搜索 HTTP {resp.status}"
+                        f"（第 {attempt}/{attempts} 次）：{reason}"
+                    )
+                    if not retryable:
+                        return ""
+# 只有瞬时故障值得重试：超时、连接中断、5xx；其它异常（如响应体不是 JSON）直接放弃
+            except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"{LOG_PREFIX} Grok 搜索失败（第 {attempt}/{attempts} 次）：{e}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{LOG_PREFIX} Grok 搜索响应异常，不再重试：{e}")
+                return ""
+            if attempt < attempts:
+                # 超时/网络抖动多为瞬时问题，退避后再试；最后一次失败交给上层降级
+                await asyncio.sleep(min(2, attempt))
+        if data is None:
+            logger.warning(f"{LOG_PREFIX} Grok 搜索 {attempts} 次尝试仍失败：{last_err}")
             return ""
 
         text, sources = self._parse_grok_search(data)
