@@ -302,6 +302,12 @@
     "hint": "模型返回 unknown 时展示",
     "default": "⚠️ 布吉岛"
   },
+  "enable_roast": {
+    "description": "判定后追加锐评调侃",
+    "type": "bool",
+    "hint": "开启后在核查结论后追加「😏 锐评调侃」一块；关闭则只显示核查结果/未判定原因，下面的锐评提示词不生效",
+    "default": false
+  },
 "unknown_roast_prompt": {
 "description": "核查后追加的调侃/锐评提示词",
     "type": "text",

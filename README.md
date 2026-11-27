@@ -27,7 +27,7 @@
 
 **判定结果呈现**
 
-- 分块输出：`true` / `false` 返回「📌 核查结果 + 😏 锐评调侃」，`unknown` 返回「📝 未判定原因 + 😏 锐评调侃」——先说清为什么判不了（信息不足、涉及私人信息、说法主观、资料矛盾），再调侃；`unknown_roast_prompt` 留空即回到「判定 + 核查解释」样式，模型未按格式输出时也自动回退旧样式。
+- 分块输出：`true` / `false` 返回「📌 核查结果 + 😏 锐评调侃」，`unknown` 返回「📝 未判定原因 + 😏 锐评调侃」——先说清为什么判不了（信息不足、涉及私人信息、说法主观、资料矛盾），再调侃；`enable_roast` 关闭（默认）或 `unknown_roast_prompt` 留空即回到「判定 + 核查解释」样式，模型未按格式输出时也自动回退旧样式。
 - 新增 `reply_quote_mode`（`quote` / `at` / `none`）：默认引用触发消息，拿不到消息 ID 时退回 @ 提问者；回复不再附加「来源：<模型名>」，模型名仅写日志。
 - 新增贴表情提示（移植 astrbot_plugin_iamthinking）：开始核查贴「处理中」表情，结束按 true / false / unknown / 失败换贴对应表情；仅 aiocqhttp 生效，其它平台自动跳过。
 - 判定解析增强：无首行判定词时，从回复前几行和核查块中识别信号，多个信号按出现位置取最早，避免解释文字把判定带偏。
@@ -67,7 +67,7 @@
 
 展示文案可通过 `true_label` / `false_label` / `unknown_label` 自定义。
 
-输出按判定分块，`true` / `false` 出「核查结果 + 锐评调侃」两块，`unknown` 只出调侃一块（不再显示核查解释）。把 `unknown_roast_prompt` 留空则回到「判定 + 核查解释」的老样式。
+输出按判定分块，`true` / `false` 出「核查结果 + 锐评调侃」两块，`unknown` 只出调侃一块（不再显示核查解释）。`enable_roast` 关闭（默认）或把 `unknown_roast_prompt` 留空则回到「判定 + 核查解释」的老样式。
 
 ```
 ✅ 真的喵
@@ -133,6 +133,7 @@
 | `max_forward_fetch` | 远程 get_forward_msg 次数（硬上限 20，含嵌套；重复 id 跳过） | 8 |
 | `max_forward_images` | 合并转发最多提取图片数（硬上限 20） | 8 |
 | `true_label` / `false_label` / `unknown_label` | 三态展示文案 | 真的喵 / 假的喵 / 布吉岛 |
+| `enable_roast` | 锐评总开关：开启后在核查结论后追加「😏 锐评调侃」；关闭则只显示核查结果 / 未判定原因，锐评提示词不生效 | false |
 | `unknown_roast_prompt` | 核查后追加调侃/锐评的提示词：并进终判系统提示词，由同一次模型回复分块输出，`true`/`false` 出「📌 核查结果 + 😏 锐评调侃」两块，`unknown` 只出调侃一块；留空则关闭调侃、只显示核查解释 | 见默认值 |
 | `reply_quote_mode` | 判定结果如何指代被核查的消息：`quote` 引用触发消息 / `at` 只 @ 提问者 / `none` 纯文字 | `quote` |
 | `enable_emoji_reaction` | 贴表情提示：开始核查时给触发消息贴「处理中」表情，结束时换成判定结果对应的表情（仅 aiocqhttp 生效，其它平台自动跳过） | true |
@@ -238,6 +239,9 @@ astrbot_plugin_isittrue/
 
 ## 更新日志
 
+### v1.8.7
+
+- **feat**: 新增配置 `enable_roast`（默认 `false`）：锐评调侃的独立总开关。关闭时不再拼接分块输出要求、不再调用调侃流程，回复只保留「核查结果」或「未判定原因」；需要锐评时把它打开并保留 `unknown_roast_prompt` 的提示词即可。升级后默认关闭锐评，原本靠提示词默认值自动锐评的行为需要手动开启
 ### v1.8.6
 
 - **fix**: 请求缓存 `_cache_key()` 缩进修复：`quoted_id` 只在 `if isinstance(comp, Reply)` 分支里赋值，`if quoted_id:` 却落在循环体层级，只要消息里没有引用（纯文本触发，如「XX 风评不太好 真的假的」）第一次迭代就读未赋值的局部变量，抛 `UnboundLocalError`，整条核查在规划之前中止并回落成「判断失败，请稍后重试。」；因为 `check_cache_ttl` 默认非 0，所有非引用触发都会中招。现在「取引用消息 ID」的分支连同判空一起包进 `isinstance(comp, Reply)` 内

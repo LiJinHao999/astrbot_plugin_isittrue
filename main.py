@@ -26,7 +26,7 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 LOG_PREFIX = "[是真的吗]"
-PLUGIN_VERSION = "1.8.6"
+PLUGIN_VERSION = "1.8.7"
 DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
@@ -1093,10 +1093,13 @@ class IsItTrue(Star):
             ).strip()
             or DEFAULT_UNKNOWN_LABEL
         )
+# 锐评总开关：关闭时不启用分块调侃，只显示核查结果/未判定原因
+        self.roast_enabled: bool = _config_bool(config, "enable_roast", False)
 # 留空则不启用：只显示核查解释，不额外调用锐评模型
-        self.unknown_roast_prompt: str = str(
+        roast_prompt = str(
             config.get("unknown_roast_prompt", DEFAULT_ROAST_PROMPT) or ""
         ).strip()
+        self.unknown_roast_prompt: str = roast_prompt if self.roast_enabled else ""
         self.reply_quote_mode: str = (
             str(config.get("reply_quote_mode", "quote") or "quote").strip().lower()
         )
